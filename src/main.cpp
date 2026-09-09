@@ -4,8 +4,12 @@
 // A door alarm that only fires inside a user-armed window, so routine daily
 // entry/exit does not cause alert fatigue.
 //
-// Sensing geometry: 3 ultrasonic sensors stacked vertically on the jamb,
-// aimed at the CLOSED leaf's face at 10-20 cm. Door open => distance INCREASES.
+// Sensing geometry (PRD §8.1): 3 ultrasonic sensors taped to the frame jamb,
+// angled across the doorway. Closed door -> the beam clears the leaf and hits
+// the far wall (a large, stable baseline). Opening leaf swings INTO the beam ->
+// the reading DROPS. So door-open = distance decrease from baseline.
+// (Flip DOOR_OPEN_IS_FARTHER for the alternate mount: sensor facing the closed
+// leaf at ~15 cm, where opening makes the reading jump up.)
 // The three are fired sequentially ~60 ms apart to avoid crosstalk.
 //
 // Arm  : auto-baseline captured now (door must be shut). Alarm on deviation
@@ -54,9 +58,16 @@ static const uint32_t PUBLISH_MS       = 1000;    // push telemetry to Blynk
 static const uint32_t NETCHECK_MS      = 5000;    // WiFi reconnect watchdog
 
 static const uint16_t PING_GAP_MS      = 60;      // spacing between the 3 pings (anti-crosstalk)
-static const uint32_t ECHO_TIMEOUT_US  = 17000;   // ~2.9 m ceiling; 0 return => sensor unhealthy
+static const uint32_t ECHO_TIMEOUT_US  = 25000;   // ~4.3 m ceiling (closed-door baseline is the far wall)
 static const uint8_t  BASELINE_SAMPLES = 5;       // readings per sensor at arm time -> median
 static const uint8_t  PERSIST_N        = 3;       // consecutive all-open cycles -> alarm (~0.9 s)
+
+// Mounting geometry (PRD §8.1). false = our build: sensor angled across the
+// doorway, closed door reads the far wall, an opening leaf swings into the beam
+// so the reading DROPS -> door-open = (baseline - dist) > delta.
+// true = alternate mount: sensor faces the closed leaf at ~15 cm, opening makes
+// the reading jump up -> door-open = (dist - baseline) > delta.
+static const bool     DOOR_OPEN_IS_FARTHER = false;
 
 static const float    DELTA_DEFAULT_CM = 4.0f;    // until the V5 slider syncs from the server
 static const float    DELTA_MIN_CM     = 2.0f;
@@ -242,7 +253,9 @@ void sensorCycle() {
         if (baseline[i] <= 0.0f) baseline[i] = d;
         else baseline[i] += (d - baseline[i]) * BASELINE_EMA_ALPHA;
       }
-      openFlag[i] = (d - baseline[i]) > deltaCm;   // door open => distance increases
+      float deviation = DOOR_OPEN_IS_FARTHER ? (d - baseline[i])   // leaf swings out of beam
+                                             : (baseline[i] - d);  // leaf swings into beam (our mount)
+      openFlag[i] = deviation > deltaCm;
     } else {
       openFlag[i] = false;                      // an unhealthy sensor cannot vote "open"
     }
@@ -320,6 +333,8 @@ void readEnvironment() {
   float h = dht.readHumidity();
   if (!isnan(t)) lastTempC    = t;
   if (!isnan(h)) lastHumidity = h;
+  Serial.printf("[env] t=%.1f C  h=%.0f %%%s\n", lastTempC, lastHumidity,
+                (isnan(t) || isnan(h)) ? "   (DHT read failed)" : "");
 }
 
 // --------------------------------------------------------------------------
@@ -371,7 +386,10 @@ void doArm() {
   persistArmed(true);
   armChirp();
   Serial.println("[arm] ARMED");
-  if (Blynk.connected()) Blynk.virtualWrite(VPIN_STATE, "ARMED");
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(VPIN_ARM, 1);             // keep the app switch in sync
+    Blynk.virtualWrite(VPIN_STATE, "ARMED");
+  }
 }
 
 void disarm(const char *src) {
@@ -415,6 +433,29 @@ BLYNK_CONNECTED() {
   if (pendingIntrusionEvent) {
     Blynk.logEvent("intrusion_alarm");
     pendingIntrusionEvent = false;
+  }
+}
+
+// --------------------------------------------------------------------------
+// Serial control — TEST AID ONLY
+//
+// The spec (PRD §16) is "arm via the Blynk switch only". This hook lets you
+// arm/disarm from the USB serial monitor so the alarm path can be bench-tested
+// without standing up Blynk. Set ALLOW_SERIAL_CONTROL = false for a spec-clean
+// build.  Keys:  a = arm    d = disarm    ? = print state
+// --------------------------------------------------------------------------
+static const bool ALLOW_SERIAL_CONTROL = true;
+
+void handleSerialControl() {
+  if (!ALLOW_SERIAL_CONTROL) return;
+  while (Serial.available()) {
+    switch (Serial.read()) {
+      case 'a': Serial.println("[serial] arm request");    doArm();          break;
+      case 'd': Serial.println("[serial] disarm request"); disarm("serial"); break;
+      case '?': Serial.printf("[serial] state=%s armed=%d alarm=%d streak=%u\n",
+                              stateString(), (int)armed, (int)alarmed, openStreak); break;
+      default: break;
+    }
   }
 }
 
@@ -468,6 +509,7 @@ void setup() {
 }
 
 void loop() {
+  handleSerialControl();                           // TEST AID — see ALLOW_SERIAL_CONTROL
   if (WiFi.status() == WL_CONNECTED) Blynk.run();  // gated so an offline run() can't stall the loop
   timer.run();
 }
