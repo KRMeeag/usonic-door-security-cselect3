@@ -29,7 +29,7 @@ just the user's tolerance — filters out routine use.
 - Provide an early **warning** for forced-entry noise (banging, prying) even before the door
   gives way — a break-in is not guaranteed to trip the door sensor first.
 - Notify the user in near-real-time via Blynk.
-- Satisfy all CS Elect3 midterm rubric requirements (component list, theme, algorithm,
+- Satisfy all CS Elect 3 midterm rubric requirements (component list, theme, algorithm,
   functional prototype).
 - Build using primarily already-owned hardware.
 
@@ -69,8 +69,8 @@ different sensor logic, different hazard type. This is intrusion detection speci
 
 | Component | Role | Source |
 | --- | --- | --- |
-| ESP32 | Main controller | Course kit |
-| 3× HC-SR05 ultrasonic | Door open/closed detection via 3-sensor consensus (additional sensor) | Confirmed in hand |
+| ESP32-S3-WROOM-1 (DevKitC-1) | Main controller | Course kit |
+| 3× HC-SR04/SR05 ultrasonic | Door open/closed detection via 3-sensor consensus (additional sensor) | Confirmed in hand |
 | Sound sensor (LM393, digital out) | Forced-entry noise → early warning (required component) | Confirmed in hand |
 | DHT11 | Passive ambient temp/humidity telemetry (required component) | Confirmed in hand |
 | Passive piezo speaker | Alarm + arm/disarm chirp actuator | Confirmed in hand |
@@ -86,16 +86,30 @@ finalized.
 This is the "why" behind each non-obvious decision — reuse this prose directly in the
 Methods/Discussion sections; it's the justification a reader or panel member will ask for.
 
-**8.1 Sensing geometry.** The three ultrasonic sensors mount on the door **frame/jamb**,
-aimed at the face of the **closed door leaf** at a 10–20cm standoff, spaced vertically
-~50–60cm apart (roughly knee/chest/head height). A closed door is a stable, flat, nearby
-target. When the door opens, the leaf swings away from all three beams and each reading jumps
-from ~10–20cm to well past 50cm — **door-open is a distance increase, not a decrease.** This
-was chosen over the inverse (sensors aimed into the room, closed door reading a distant far
-wall) because that geometry only works if the door happens to swing toward the mounting side,
-and any person or object passing between the sensor and the far wall produces the same signal
-as a door opening. Anchoring the baseline to a fixed, nearby physical surface — the door
-itself — is far more robust than anchoring it to "whatever happens to be far away right now."
+**8.1 Sensing geometry.** The three ultrasonic sensors are fixed to the door **frame/jamb** on
+the leaf side, spaced vertically ~50–60cm apart (roughly knee/chest/head height) and **angled
+across the doorway** so that with the door closed each beam clears the leaf edge and lands on
+the far wall / across the room — a large, stable baseline. When the door opens, the swinging
+leaf moves **into** each beam's path and intercepts it much closer to the sensor, so every
+reading **drops sharply below its baseline** — **door-open is a distance decrease.**
+
+This matches how the sensors physically mount (taped flush to the jamb, no bracket or standoff
+needed) and puts the moving object being measured — the leaf itself — directly in the
+detection path. The known trade-off, carried into §14: anything else that crosses a beam (a
+person walking through, an object set down in the doorway) produces the same "closer" signal,
+which is why detection is gated on **all three** stacked beams agreeing plus a persistence
+count (§8.2, §11) rather than any single beam. The firmware keeps a
+`DOOR_OPEN_IS_FARTHER` switch for the inverse mount (sensor facing the closed leaf at ~15cm,
+where opening makes the reading increase) — set `false` for this build.
+
+If the far wall is beyond the sensor's ~4.3m range the closed-door beam returns no echo. The
+firmware handles this by reading the ECHO line's edges directly: a live sensor always asserts
+ECHO shortly after its trigger pulse (holding it high in proportion to distance, or high for
+its own internal maximum when nothing is in range), whereas a faulty or disconnected sensor
+never asserts it at all. So "nothing in range" is reported as a fixed ceiling
+(`DIST_MAX_CM` ≈ 431cm, an armable baseline) while a genuine fault stays flagged unhealthy —
+the two are no longer conflated as a bare timeout. A leaf swinging into a beam still drops
+that reading by hundreds of cm, so the ceiling baseline detects opening just as well.
 
 **8.2 Why three sensors, not one.** A single ultrasonic sensor cannot distinguish "the door
 opened" from "a sensor glitched" or "something briefly blocked the beam." Requiring **three
@@ -105,13 +119,27 @@ spurious single-sensor triggers. The three sensors are fired **sequentially** (~
 never simultaneously) because concurrent HC-SR04 ultrasonic pulses cross-talk and corrupt each
 other's echo readings.
 
-**8.3 Auto-baseline calibration.** Rather than hand-tuning a fixed distance threshold against
-one specific door (which would need to be redone for any other door, mounting height, or
-sensor-to-leaf gap), the firmware captures each sensor's own closed-door reading **at the
-moment the user arms the system** and treats that as its personal zero-point. The alarm
-condition is then framed as *deviation from self-captured baseline*, not *distance below a
-hardcoded number*. This makes the system self-calibrating and portable across doors, at the
-cost of one operating rule: the door must be closed at the moment of arming.
+**8.3 Threshold, not auto-calibration.** An earlier draft of this design captured each
+sensor's closed-door reading at arm time and framed the alarm as *deviation from that
+self-captured baseline* — workable for a sensor aimed at the closed leaf a fixed 10–20cm
+away, where the baseline is always a small, predictable number. It breaks down for the
+across-the-doorway mount actually built here (§8.1): the closed-door baseline is whatever
+happens to be across the room, anywhere from tens of centimetres to several metres, so a
+deviation sized to be meaningful at one baseline is either swamped by real readings or
+triggered by noise at another — this was tried on the bench and confirmed unworkable.
+
+The firmware instead uses an absolute, physically-measured **trip distance**
+(`thresholdCm`, Blynk V5): at install time, measure how far the door leaf sits from a sensor
+once it has swung far enough into that sensor's beam to count as "opening," and set the
+slider to that number. A sensor reads open the moment its live distance crosses the
+threshold — no baseline comparison at all. At arm time the firmware still takes a
+closed-door reading per sensor (median of 5), but only as a **health and sanity check**: it
+confirms the sensor is alive, and refuses to arm if a sensor's closed-door reading already
+sits past the threshold (a sign the slider or the aim needs adjusting, since that channel
+would read "open" before anyone touches the door). Named honestly for the paper: this is
+less "self-calibrating" than a baseline-deviation design would be, at the cost of one
+manual measurement per installation — but that measurement is far more legible and
+debuggable than tuning a delta against an arbitrary, invisible baseline (§14).
 
 **8.4 Two-tier alert model.** The sound sensor and the ultrasonic consensus feed two different
 alert tiers, not one shared trigger:
@@ -142,48 +170,55 @@ never stalls the sensor loop.
 
 ## 9. Wiring & Pinout
 
-**Physical mounting (side view, door closed):**
+**Physical mounting (top-down view):**
 ```
-  DOOR FRAME (sensors fixed here)         DOOR LEAF (swings away from sensors)
-  ┌───────────────────────┐
-  │ [S1]═══▶  ~150cm (head)│   10-20cm    ┌─────────────┐
-  │ [S2]═══▶  ~100cm (chest)│───gap when──▶│             │
-  │ [S3]═══▶  ~ 40cm (knee) │   closed     │             │
-  │                         │              └─────────────┘
-  │  ESP32 + dividers       │
-  │  mounted on frame       │        hinge ►
-  └───────────────────────┘
+  CLOSED                                  OPEN
+  jamb ┌──────────────────  far wall      jamb ┌──────────────────  far wall
+  [S]══╪═══════════════════▶ ~200cm       [S]══╪══▶ ~35cm
+       │  (beam clears leaf)                   │ ╲ leaf swung INTO the beam
+   ────┘leaf│                              ────┘  ╲────  leaf
+           │(closed, beside sensor)                     (open)
 ```
-Open door: all three readings jump from ~10–20cm to 50cm+ (§8.1). Sequential firing order is
-S1 → S2 → S3, ~60ms apart, repeating every 300ms.
+Closed door: each beam misses the leaf and reads the far wall (large, stable baseline).
+Open door: the leaf swings into the beam and each reading **drops** well below baseline (§8.1).
+Sensors stack vertically ~50–60cm apart (knee/chest/head); firing order S1 → S2 → S3, ~60ms
+apart, repeating every 300ms. A far wall beyond the sensor's ~4.3m range is fine — the
+firmware reports it as a fixed ceiling (`DIST_MAX_CM`) and still arms; only a genuinely
+faulty sensor blocks arming (§8.1). `v` in the serial monitor shows which of the three:
+a cm value, `> 431 cm` (far, OK), or `FAULT`.
 
 **Electrical block diagram:**
 ```
- HC-SR04 x3            [1kΩ]──┬──[2kΩ]         ESP32 DevKit             Blynk Cloud
- ECHO (5V) ────────────┘      └──GND    ───►  GPIO 34/35/36                 │
- TRIG (3.3V) ◄─────────────────────────────── GPIO 25/26/27                 │
+ HC-SR04 x3            [1kΩ]──┬──[2kΩ]      ESP32-S3-DevKitC-1          Blynk Cloud
+ ECHO (5V) ────────────┘      └──GND    ───►  GPIO 4/5/6                    │
+ TRIG (3.3V) ◄─────────────────────────────── GPIO 15/16/17                 │
                                                                              │
- Sound sensor DO ──────────────────────────►  GPIO 39                      │
+ Sound sensor DO ──────────────────────────►  GPIO 7                       │
  DHT11 data     ◄────────────────────────►   GPIO 18            WiFi ──────┘
- LED 1-5        ◄──────────────────────────  GPIO 16,17,21,22,19    (2.4GHz only)
- Passive piezo  ◄──────────────────────────  GPIO 23 (tone())          │
+ LED 1-5        ◄──────────────────────────  GPIO 8,9,10,11,12     (2.4GHz only)
+ Passive piezo  ◄──────────────────────────  GPIO 13 (tone())          │
                                                                     Blynk App
-                                                          (arm switch, delta slider,
+                                                          (arm switch, threshold slider,
                                                            live dashboard, events)
 ```
 
-**GPIO table:**
+**GPIO table (ESP32-S3-WROOM-1):**
 
 | Signal | GPIO | Note |
 | --- | --- | --- |
-| ECHO 1/2/3 | 34, 35, 36 | input-only; **each behind a 1k+2k divider** — ECHO idles at 5V and ESP32 is not 5V tolerant |
-| SOUND DO | 39 | input-only; power the module from 3.3V so DO is already 3.3V, no divider needed |
-| TRIG 1/2/3 | 25, 26, 27 | individual, never shared (sequential firing) |
+| ECHO 1/2/3 | 4, 5, 6 | **each behind a 1k+2k divider** — ECHO idles at 5V and the S3 is not 5V tolerant |
+| SOUND DO | 7 | power the module from 3.3V so DO is already 3.3V logic, no divider needed |
+| TRIG 1/2/3 | 15, 16, 17 | individual, never shared (sequential firing) |
 | DHT11 | 18 | bidirectional |
-| LED 1–5 | 16, 17, 21, 22, 19 | |
-| PIEZO | 23 | passive, driven with `tone()` |
+| LED 1–5 | 8, 9, 10, 11, 12 | each via ~330 Ω |
+| PIEZO | 13 | passive, driven with `tone()` (LEDC) |
 
-14 pins total. Avoids strapping pins (0/2/12/15), flash pins (6–11), and UART0 (1/3).
+14 pins, all in the S3's universally-safe low band. The S3 has **no input-only pins** — every
+GPIO is bidirectional — so the divider on ECHO is now purely for the 5 V level, not a pin
+constraint. Avoids: strapping pins (0/3/45/46), native-USB/JTAG (19/20), the UART0 console
+(43/44 — the "UART" USB-C port used for the serial monitor), SPI-flash/PSRAM (26–37), and the
+on-board RGB LED (38/48). ADC1 on the S3 is GPIO 1–10, so if anything analog is ever re-added
+(e.g. sound AO) it lands there; GPIO 1/2/14/21 are left free as spares.
 
 ## 10. Blynk Virtual Pin / Widget Specification
 
@@ -194,17 +229,25 @@ Free tier allows 50 datastreams and 5 events per template — comfortably within
 | V0 | Arm/Disarm switch | int 0/1 | writing 1 triggers baseline capture (§8.3); requires door closed |
 | V1 | Temperature | double | DHT11, streamed continuously regardless of armed state |
 | V2 | Humidity | double | DHT11, streamed continuously regardless of armed state |
-| V3 | Door state | int (0 closed / 1 open) | reflects live consensus, active regardless of armed state |
+| V3 | Door state | int (0 closed / 1 open) | live 3-sensor consensus, **the door right now** — not the alarm; an intruder closing the door behind them clears this while the alarm stays latched. Active regardless of armed state |
 | V4 | System state | string | `DISARMED` / `ARMED` / `ALARM` |
-| V5 | Deviation delta (cm) | slider | the one runtime-tunable threshold; persistence count is a firmware constant |
+| V5 | Trip threshold (cm) | slider, 5–200 | absolute distance, physically measured per install (§8.3) — not a deviation from baseline. The one runtime-tunable value; persistence count is a firmware constant. Set the datastream **default value = 30** so the on-connect sync lands sane |
+| V6 | Sound | int 0/1 | LED widget. `1` if the LM393 DO fired at least once in the last ~1 s push window — the dashboard presence for the sound sensor (its only other surface is the `door_noise_warning` event) |
+| V7 | Alarm | int 0/1 | LED widget, solid. `1` while the alarm is latched. Blynk LED widgets can't blink — the fast-blink alarm indicator is hardware LED5; this is the app's unmistakable latched-alarm light, paired with V4 |
 
 Events (Blynk notifications): `intrusion_alarm`, `door_noise_warning`.
+
+Widget notes: V4 reads best as a Label/Value-Display with conditional colour (green
+DISARMED / amber ARMED / red ALARM). V3, V6, V7 are LED widgets. V0 is the only control that
+writes a pin (the device writes V0 back to sync after arm/disarm/boot — don't add a second
+control on it).
 
 ## 11. Algorithm
 
 This is the rubric-required "basic algorithm for automation/decision-making." In prose: while
-armed, the system treats the door as open only when all three ultrasonic sensors agree it has
-moved away from its own closed-door baseline, and only after that agreement holds for several
+armed, the system treats the door as open only when all three ultrasonic sensors' live
+readings have crossed a physically-measured trip threshold (§8.3 — the distance at which the
+swinging leaf intercepts each beam), and only after that agreement holds for several
 consecutive readings (rejecting single-cycle glitches) — at which point it raises a latched
 alarm that only a deliberate disarm can clear. A loud sound alone is downgraded to a
 non-blocking warning rather than the full alarm, since it is corroborating, not conclusive.
@@ -212,14 +255,17 @@ non-blocking warning rather than the full alarm, since it is corroborating, not 
 ```
 on arm (Blynk V0 = 1):
   require door closed, all 3 sensors healthy
-  take 5 readings per sensor, median → baseline[i]
+  take 5 readings per sensor, median → baseline[i]   # health + sanity check only, not compared below
+  reject arm if any baseline[i] already past THRESHOLD_CM
   persist armed=true to NVS
 
 every 300ms:
   for i in 0..2:
     ping sensor i, wait ~60ms before next        # sequential, avoids crosstalk
-    healthy[i] = echo returned within timeout
-    open[i]    = (dist[i] - baseline[i]) > DELTA_CM
+    healthy[i] = ECHO asserted after trigger      # faulty/disconnected => not healthy
+    dist[i]    = pulse width in cm, or DIST_MAX_CM if ECHO never fell (nothing in range)
+    open[i]    = dist[i] <= THRESHOLD_CM          # leaf swung into the beam (§8.1)
+                 # inverse mount: dist[i] >= THRESHOLD_CM, via DOOR_OPEN_IS_FARTHER
 
   LED1..3 = off if !healthy[i], blink if open[i], else solid
   LED4    = soundDO
@@ -283,6 +329,17 @@ State these explicitly rather than leaving them implicit:
 - **Sound sensor does not escalate sensitivity.** A design where a detected bang temporarily
   lowers the persistence requirement (§11's `PERSIST_N`) for ~30 seconds was considered and
   declined for MVP scope. Worth naming as a natural extension of the two-tier model (§8.4).
+- **Trip threshold is manually measured, not self-calibrating.** V5 (`thresholdCm`) must be
+  physically measured and set per installation (§8.3) — a deviation-from-baseline design would
+  have auto-calibrated at arm time, but that model didn't hold up for a mount whose baseline is
+  an arbitrary far-wall distance (§8.3). Re-measure and re-set the slider if the sensors are
+  remounted or the doorway changes.
+- **Beam-crossing ambiguity.** With the across-the-doorway mounting (§8.1), any object that
+  enters a beam — a person stepping through, something set down in the opening — produces the
+  same "closer" signal as the door leaf. The three-beam consensus plus persistence count
+  mitigates but does not eliminate this; a determined slow approach along all three beam
+  heights could still read as an opening. A depth/geometry check or pairing with the hinge-side
+  angle is the natural hardening step.
 - Single entry point, no lock actuation, no camera/facial recognition — see §4 Non-Goals.
 
 ## 15. MVP Scope Cuts
@@ -294,8 +351,8 @@ thinking they were overlooked:
   §13 no longer collects. Digital output alone drives the warning tier.
 - **Temporal-coherence window** between sensor trigger times — "all 3 deviate, sustained N
   cycles" (§11) is already a complete decision rule without it.
-- **Second Blynk slider for persistence count** — auto-baseline (§8.3) removed most of the
-  need for hand-tuning; one delta slider (V5) is enough.
+- **Second Blynk slider for persistence count** — one threshold slider (V5, §8.3) plus the
+  fixed `PERSIST_N` constant is enough; a second tunable wasn't worth the added surface.
 - **NVS persistence for slider values** — Blynk retains datastream values server-side and
   re-syncs on reconnect; only the armed flag needs local persistence.
 - Ablation testing, false-positive trials, time-scheduled arming, sound-triggered sensitivity
@@ -305,49 +362,71 @@ thinking they were overlooked:
 
 ## 16. Engineering Build Plan (for the coding agent)
 
-The repo is currently a bare PlatformIO scaffold: [platformio.ini](platformio.ini) targets
-`esp32dev` + Arduino framework, and [src/main.cpp](src/main.cpp) is still the generated stub.
-Everything below is greenfield. Not a git repo.
+Target board: **ESP32-S3-WROOM-1 (DevKitC-1)**, `board = esp32-s3-devkitc-1`. Serial is UART0
+— use the USB-C port silk-screened **"UART"** (the CP210x bridge), not the native-USB port.
+Git repo (`origin` on GitHub) — `include/secrets.h` is gitignored; copy
+`include/secrets.h.example` to `include/secrets.h` and fill in real values.
 
 ### Files
 
-- **[platformio.ini](platformio.ini)** — **pin `platform = espressif32@<version>`** (the LEDC
-  API used by `tone()` changed between Arduino-ESP32 core 2.x and 3.x; a floating toolchain
-  that breaks pre-demo is avoidable). Add `lib_deps`: `blynkkk/Blynk`,
-  `adafruit/DHT sensor library`, `adafruit/Adafruit Unified Sensor`.
-- **`include/secrets.h`** (new) — WiFi SSID/pass + `BLYNK_AUTH_TOKEN`. Not a git repo, so no
-  gitignore or example-file ceremony needed.
-- **[src/main.cpp](src/main.cpp)** — single file is correct for MVP scope. Sections: pin
+- **[platformio.ini](platformio.ini)** — `platform` pinned to `espressif32@7.0.1` (ships
+  Arduino-ESP32 core 2.0.17; the LEDC API used by `tone()` changed in core 3.x, and a floating
+  toolchain that breaks pre-demo is avoidable). **One environment**, `esp32-s3-devkitc-1`,
+  one binary — `pio run -t upload` / the PlatformIO → button just works, no `-e`.
+  `build_flags = -DARDUINO_USB_CDC_ON_BOOT=0`. `lib_deps`: `blynkkk/Blynk@1.3.5`,
+  `adafruit/DHT sensor library@1.4.7`, `adafruit/Adafruit Unified Sensor@1.1.15`
+  (exact-pinned for demo-day reproducibility).
+- **[include/pins.h](include/pins.h)** (new) — the GPIO map + `SOUND_ACTIVE_LOW`.
+- **[include/secrets.h](include/secrets.h)** (new) — WiFi SSID/pass, `BLYNK_AUTH_TOKEN`,
+  `BLYNK_TEMPLATE_ID`, `BLYNK_TEMPLATE_NAME`, included before the Blynk header. These live
+  here **only** — defining them again in `main.cpp` silently overrides this file.
+- **[src/main.cpp](src/main.cpp)** — single file. Sections: Blynk datastream defines, timing
   constants, armed-flag NVS via `Preferences`, sequential ultrasonic read, DHT11 (min 2s
-  interval), LED driver, buzzer behind a small `sirenOn()/sirenOff()` wrapper, `BlynkTimer`
-  tasks, `BLYNK_WRITE(V0/V5)` handlers.
+  interval), LED driver, siren behind a `sirenOff()`/`serviceSiren()` wrapper, `BlynkTimer`
+  tasks, `BLYNK_WRITE(V0/V5)` + `BLYNK_CONNECTED()` handlers. Arming is Blynk-switch-only per
+  §8.3; serial-monitor arm/disarm (`a`/`d`) sits behind `ALLOW_SERIAL_CONTROL` as a bench aid
+  — set it `false` for a spec-clean build. Hardware bring-up checks are also serial commands
+  (`h` lists them): **`p` toggles the serial output between deployment view (`[cyc]` + `[env]`
+  lines) and a bring-up view** (one hwcheck-style `US/SND/DHT` status line + LED1-3 = raw echo
+  health); `v` one-shot verbose ping burst, `t` LED/piezo self-test, `b` buzzer, `m` pin map,
+  `?` state. (This replaces the former standalone `hw_check.cpp` / second env.) A boot
+  Easter egg — LED sweep + music-synced LED dance + piezo jingle — runs once first thing in
+  `setup()`; `PLAY_BOOT_EGG = false` reduces it to a 0.3s LED blip.
 
-**Non-blocking Blynk is load-bearing** — use `Blynk.config()` + `Blynk.connect(timeout)`,
-never blocking `Blynk.begin()` in `setup()`, and never let `Blynk.run()` stall the sensor loop.
+**Non-blocking Blynk is load-bearing** — use `Blynk.config()` + a `Blynk.run()` gated on
+`WiFi.status() == WL_CONNECTED`, never blocking `Blynk.begin()` in `setup()`, and never let
+`Blynk.run()` stall the sensor loop.
 
 ### Build order
 
-**Blynk goes first, not last.** WiFi + auth is the riskiest unknown (ESP32 is 2.4GHz-only,
-campus WiFi is often 5GHz or captive-portal). Discovering that on day 3 is a disaster;
-discovering it in hour 1 costs nothing.
+**Blynk goes first, not last.** WiFi + auth is the riskiest unknown (the ESP32-S3 is
+2.4GHz-only, campus WiFi is often 5GHz or captive-portal). Discovering that on day 3 is a
+disaster; discovering it in hour 1 costs nothing.
 
-1. **Blynk hello-world** — ESP32 connects, one datastream toggles from the app. Nothing else.
+0. **Bring-up checks first** — flash, open the monitor, send `t` (LED/piezo self-test) and
+   `p` (toggle to the bring-up view). Confirm every LED lights, the piezo chirps, and each
+   sensor reports sane cm before relying on the decision logic. `p` again to return to `[cyc]`.
+1. **Blynk hello-world** — S3 connects, one datastream toggles from the app. Nothing else.
 2. Wire and verify **one** ultrasonic with its divider; print distance to serial.
 3. Add sensors 2 and 3 with sequential firing; confirm no crosstalk (stable readings).
 4. LEDs + passive piezo (`tone()` two-tone siren, short chirp on arm/disarm).
-5. Baseline capture + deviation + persistence, tested over serial, **still offline**.
+5. Threshold check + persistence, tested over serial, **still offline** (§8.3).
 6. Sound sensor DO, DHT11.
-7. Wire it all into Blynk — remaining datastreams, arm switch, delta slider, events,
+7. Wire it all into Blynk — remaining datastreams, arm switch, threshold slider, events,
    armed-flag NVS.
 
 ### Verification
 
-- `pio run` builds; `pio run -t upload && pio device monitor` shows per-sensor distance,
-  health, baseline, and state on every cycle.
-- **Bench:** hold a flat board at ~15cm, arm, remove it — all 3 LEDs blink in sequence,
-  siren fires, Blynk notification arrives. Disarm from app clears the latch.
+- `pio run` builds; `pio run -t upload && pio device monitor` (or the → / 🔌 buttons) shows
+  per-sensor distance, health, baseline, and state on every `[cyc]` line plus `[env]` DHT.
+- **Wiring:** boot LED sweep hits all 5; `t` chirps the piezo; `v` reports cm (not `NO ECHO`)
+  for all three with a target in range; the bring-up view (`p`) shows plausible `°C`/`%`.
+- **Bench:** with nothing closer than the threshold in front of any sensor, arm (§8.3); then
+  bring a flat board within the threshold distance of all three sensors and hold it — all 3
+  LEDs blink in sequence, siren fires, Blynk notification arrives. Disarm from app clears the
+  latch.
 - **Sensor fault:** unplug one ECHO while armed → its LED goes off, no alarm fires.
 - **Offline:** kill WiFi, power-cycle → armed flag survives, siren still fires locally,
   notifications resume on reconnect.
-- **Demo-day risk:** ESP32 is 2.4GHz-only and campus WiFi is often 5GHz or captive-portal —
+- **Demo-day risk:** the S3 is 2.4GHz-only and campus WiFi is often 5GHz or captive-portal —
   **test on a phone hotspot and bring one.**
