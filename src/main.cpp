@@ -55,8 +55,9 @@
 #define VPIN_THRESH V5   // slider    — Trip distance in cm (PERSIST_N is a constant)
 #define VPIN_SOUND  V6   // int 0/1   — noise detected since the last push (~1 s window)
 #define VPIN_ALARM  V7   // int 0/1   — alarm latched (solid; pairs with V4)
-#define VPIN_TRIAL_P V8  // button    — start a door-opening test trial (Req 6)
-#define VPIN_TRIAL_N V9  // button    — start a disturbance test trial (Req 6)
+#define VPIN_TRIAL_F V8  // button    — trial: panel swept through FAST  (Req 6)
+#define VPIN_TRIAL_H V9  // button    — trial: panel HELD in the beams    (Req 6)
+#define VPIN_TRIAL_N V10 // button    — trial: disturbance, must NOT alarm (Req 6)
 
 // (GPIO map lives in include/pins.h)
 
@@ -201,25 +202,32 @@ void logSample(bool sound) {
 //
 // One button press runs a whole trial cycle: clear any latch left over from
 // the previous trial, re-arm, log the ground-truth marker, then chirp "go".
+// One tap per trial, so the whole battery is a one-person job.
 //
-// This is what makes the test battery a ONE-PERSON job. You cannot press a
-// laptop key and open the door at the same moment, so the same action is
-// exposed on V8/V9 as Blynk buttons: stand at the door with the phone, tap,
-// wait for the double pip, open the door. One tap per trial.
+// Three classes, because sweep speed is the independent variable that matters:
+//   fast    a positive trial where the panel is swept THROUGH the beams, the
+//           way a briskly opened door crosses them. The midterm rule needs
+//           ~600-700 ms of sustained all-beam agreement, which a fast sweep
+//           may never supply — this class is what Tier 3 has to improve.
+//   held    a positive trial where the panel is brought in and HELD. Easy
+//           case; the midterm rule should already pass it. Having both
+//           classes turns "did it get better" into a controlled comparison
+//           rather than one pooled number.
+//   neg     the panel never fully blocks all three beams; must NOT alarm.
+// The class rides in the event's detail field, so the log schema is unchanged.
 // --------------------------------------------------------------------------
-void startTrial(bool positive) {
+void startTrial(bool positive, const char *cls) {
   if (armed || alarmed) disarm("trial");
   doArm();
-  if (!armed) {                                  // refused — door open, or a fault
-    Serial.println("[trial] ARM REFUSED — check the door is shut, then tap again");
+  if (!armed) {                                  // refused — panel in a beam, or a fault
+    Serial.println("[trial] ARM REFUSED — clear the beams, then tap again");
     tone(PIEZO_PIN, 400, 400);                   // low buzz = not ready
     currentToneHz = 0;
     return;
   }
-  csvEvent(positive ? "trial_pos" : "trial_neg");
-  Serial.printf("[trial] %s — go\n",
-                positive ? "POSITIVE (open the door)"
-                         : "NEGATIVE (disturbance only, door stays shut)");
+  csvEvent(positive ? "trial_pos" : "trial_neg", cls);
+  Serial.printf("[trial] %s (%s) — go\n",
+                positive ? "POSITIVE" : "NEGATIVE", cls);
   tone(PIEZO_PIN, 2600, 70); delay(90);          // two high pips = armed and logged
   tone(PIEZO_PIN, 2600, 70); delay(90);
   noTone(PIEZO_PIN);
@@ -602,12 +610,16 @@ BLYNK_WRITE(VPIN_ARM) {
   else                    disarm("app");
 }
 
-BLYNK_WRITE(VPIN_TRIAL_P) {
-  if (param.asInt() == 1) startTrial(true);
+BLYNK_WRITE(VPIN_TRIAL_F) {
+  if (param.asInt() == 1) startTrial(true, "fast");
+}
+
+BLYNK_WRITE(VPIN_TRIAL_H) {
+  if (param.asInt() == 1) startTrial(true, "held");
 }
 
 BLYNK_WRITE(VPIN_TRIAL_N) {
-  if (param.asInt() == 1) startTrial(false);
+  if (param.asInt() == 1) startTrial(false, "neg");
 }
 
 BLYNK_WRITE(VPIN_THRESH) {
@@ -649,8 +661,8 @@ static const bool ALLOW_SERIAL_CONTROL = true;
 void diagHelp() {
   Serial.println(F("[cmd] p toggle bring-up view | v ping-burst  t self-test  b buzzer  m pinmap"));
   Serial.println(F("[cmd] a arm  d disarm  ? state  h help"));
-  Serial.println(F("[cmd] c toggle CSV log | 1 start OPEN-DOOR trial  0 start DISTURBANCE trial"));
-  Serial.println(F("[cmd] (trials are also on Blynk V8/V9 so they can be run solo from the phone)"));
+  Serial.println(F("[cmd] c toggle CSV log | trials: 1 FAST sweep  2 HELD  0 disturbance"));
+  Serial.println(F("[cmd] (trials are also Blynk buttons V8/V9/V10 — one tap each)"));
 }
 
 void diagPinMap() {
@@ -721,8 +733,9 @@ void handleSerialControl() {
       // paths produce identical data. tools/analyze.py pairs every marker
       // with whatever the system then did, which builds the confusion matrix
       // with no hand labelling.
-      case '1': startTrial(true);  break;
-      case '0': startTrial(false); break;
+      case '1': startTrial(true,  "fast"); break;
+      case '2': startTrial(true,  "held"); break;
+      case '0': startTrial(false, "neg");  break;
       case 'c':
         csvMode = !csvMode;
         Serial.printf("[serial] CSV log %s\n", csvMode ? "ON" : "OFF");

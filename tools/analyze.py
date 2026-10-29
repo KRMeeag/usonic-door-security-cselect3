@@ -165,6 +165,10 @@ def build_trials(session, window_ms):
         trial = {
             "n": i + 1,
             "marker_ms": start,
+            # Trial class rides in the marker's detail field: fast / held / neg.
+            # Sweep speed is the independent variable, so everything downstream
+            # is reported per class as well as pooled.
+            "cls": mk["detail"].strip() or ("pos" if expect else "neg"),
             "expected": "alarm" if expect else "no_alarm",
             "observed": "alarm" if hit else "no_alarm",
             "outcome": ("TP" if expect and hit else
@@ -290,6 +294,27 @@ def report(sessions, trials, out=sys.stdout):
             w(f"    {k:<22} {v * 100:6.1f}%\n" if v == v
               else f"    {k:<22}    n/a\n")
 
+        # Per-class breakdown. This is the comparison that carries Tier 3:
+        # a held panel is the easy case the midterm rule already passes, a fast
+        # sweep is the one it can miss.
+        classes = []
+        for t in trials:
+            if t["cls"] not in classes:
+                classes.append(t["cls"])
+        if len(classes) > 1:
+            w("\n  by trial class\n")
+            for cl in classes:
+                grp = [t for t in trials if t["cls"] == cl]
+                pos = [t for t in grp if t["expected"] == "alarm"]
+                if pos:
+                    hit = sum(1 for t in pos if t["outcome"] == "TP")
+                    w(f"    {cl:<10} n={len(pos):<4} detected"
+                      f" {hit}/{len(pos)}   {100.0 * hit / len(pos):5.1f}%\n")
+                else:
+                    fp = sum(1 for t in grp if t["outcome"] == "FP")
+                    w(f"    {cl:<10} n={len(grp):<4} false alarms"
+                      f" {fp}/{len(grp)}   {100.0 * fp / len(grp):5.1f}%\n")
+
         w("\n  latency\n")
         w(describe("detect (beam->siren)",
                    [t["latency_detect_ms"] for t in trials], " ms") + "\n")
@@ -305,25 +330,34 @@ def report(sessions, trials, out=sys.stdout):
         w("  No positive trials; nothing to measure.\n")
     else:
         cyc = cycle_ms(samples) if samples else 300.0
-        for si in range(3):
-            w(describe(f"sensor {si + 1} dip span",
-                       [t[f"dip{si + 1}_ms"] for t in pos], " ms") + "\n")
+        need = 2 * cyc + 120     # (PERSIST_N-1) cycles + the intra-cycle stagger
+
+        # With a hand-moved panel the dip span is set by how fast the operator
+        # sweeps, so it is an INPUT, not a property of the system. Reported per
+        # class it says what each sweep speed actually looked like in ms, which
+        # is what makes the detection difference between classes interpretable.
+        groups = []
+        for t in pos:
+            if t["cls"] not in groups:
+                groups.append(t["cls"])
+        for cl in groups:
+            grp = [t for t in pos if t["cls"] == cl]
+            spans = [t[f"dip{si + 1}_ms"] for t in grp for si in range(3)]
+            w(describe(f"{cl} — beam dip span", spans, " ms") + "\n")
+            cleared = sum(1 for t in grp
+                          if min(t[f"dip{k + 1}_ms"] for k in range(3)) >= need)
+            w(f"    {cleared}/{len(grp)} of these held all three beams the"
+              f" ~{need:.0f} ms the midterm rule needs\n")
+
         floor = sum(1 for t in pos for si in range(3)
                     if t[f"dip{si + 1}_n"] == 1)
         total = len(pos) * 3
         w(f"\n  {floor}/{total} beam dips lasted a single sample"
-          f" (<= {cyc:.0f} ms) — at or below the\n"
-          f"  sampling resolution. A high count here means the dip is faster\n"
-          f"  than the sensor loop can see, and the round-robin ping change\n"
-          f"  (Tier 4) is needed rather than optional.\n")
-
-        # The persistence rule needs all three beams open together across
-        # (PERSIST_N - 1) cycles plus the intra-cycle stagger.
-        need = 2 * cyc + 120
-        cleared = sum(1 for t in pos
-                      if min(t[f"dip{si + 1}_ms"] for si in range(3)) >= need)
-        w(f"\n  midterm rule needs ~{need:.0f} ms of sustained all-beam"
-          f" agreement;\n  {cleared}/{len(pos)} positive trials cleared it.\n")
+          f" (<= {cyc:.0f} ms) — at or below the sampling\n"
+          f"  resolution, so those are a measurement floor and not a real\n"
+          f"  duration. A high count means the sweep is faster than the sensor\n"
+          f"  loop can see, and the round-robin ping change (Tier 4) becomes\n"
+          f"  necessary rather than optional.\n")
 
     # ---- stability -------------------------------------------------------
     w("\n" + "-" * 78 + "\n")

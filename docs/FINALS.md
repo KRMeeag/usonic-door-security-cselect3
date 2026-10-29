@@ -18,13 +18,26 @@ down at the door leaf**.
 `THRESH_DEFAULT_CM` is 20 cm to match; the V5 slider overrides it on connect.
 PRD.md has been corrected to match — any older description of a jamb mount is gone.
 
-**One consequence drives the Tier 3 work.** The leaf *sweeps through* the beam rather
-than coming to rest in it, so each sensor sees a **transient dip**, not a sustained
-state. The midterm rule needs all three sensors reading open simultaneously for
-`PERSIST_N = 3` consecutive 300 ms cycles — roughly **600-700 ms of continuous
-agreement** — and the leaf crosses the three sensors sequentially. Whether that costs
-detections is an empirical question; `tools/analyze.py` measures dip durations against
-that bar, and the baseline run answers it.
+## Validation rig
+
+Testing and the demo use a **hand-held cardboard panel standing in for the door leaf**,
+as at the midterm demo. This matters for how results are framed: the length of time a
+beam reads open is set by how fast the operator sweeps the panel, so it is a
+**controlled input, not an observed property of the system**.
+
+The battery therefore runs two positive classes:
+
+- **fast** — the panel is swept *through* the beams and kept moving, the way a briskly
+  opened door crosses them.
+- **held** — the panel is brought in and held for ~2 s. The easy case.
+
+**What Tier 3 is for.** The midterm rule needs all three sensors reading open
+simultaneously for `PERSIST_N = 3` consecutive 300 ms cycles — roughly **600-700 ms of
+continuous agreement**. A held panel supplies that comfortably; a fast sweep may not.
+If detection rate drops on the fast class, that gap is a controlled, repeatable result
+and it is exactly what the coincidence window is built to close. If both classes score
+equally well, Tier 3 has to be justified on false positives instead — and the baseline
+run is what settles which. Do not assert the gap before measuring it.
 
 ## Tiers
 

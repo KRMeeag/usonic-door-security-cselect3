@@ -54,8 +54,9 @@ idle(8)
 
 # --- positive trials: door opens, dip of varying length -------------------
 # dips sized in cycles; 3+ sustained cycles is what the midterm rule needs
-for dip_cycles in (4, 3, 2, 5, 4, 1, 3, 4, 2, 4):
-    line(f"#E,{ms},trial_pos,")
+for dip_cycles, cls in ((4,"held"),(3,"held"),(2,"fast"),(5,"held"),(4,"held"),
+                        (1,"fast"),(3,"fast"),(4,"held"),(2,"fast"),(4,"held")):
+    line(f"#E,{ms},trial_pos,{cls}")
     ms += CYC * random.randint(2, 4)          # human reaction before opening
     for k in range(dip_cycles):
         sample([18 + random.gauss(0, 2) for _ in range(3)], 7)
@@ -76,7 +77,7 @@ for dip_cycles in (4, 3, 2, 5, 4, 1, 3, 4, 2, 4):
 
 # --- negative trials: single-beam waves, sound-only, partial pushes --------
 for kind in range(8):
-    line(f"#E,{ms},trial_neg,")
+    line(f"#E,{ms},trial_neg,neg")
     ms += CYC * 2
     if kind % 3 == 0:                          # one beam only
         for _ in range(3):
