@@ -4,34 +4,27 @@
 midterm, and the paper cites it as the baseline. This file is the finals scope.
 Where the two disagree, this file wins.
 
-## Correction to PRD §8.1 — mounting geometry
+## Geometry — settled, do not re-open
 
-The PRD describes the three ultrasonic sensors as mounted on the jamb, stacked
-vertically ~50–60 cm apart at knee/chest/head height, angled across the doorway.
-**That is not how the prototype is built.** The sensors sit **on top of the door
-frame at roughly 45°, aimed down at the door leaf.**
+Three ultrasonic sensors sit **on top of the door frame at roughly 45 degrees, aimed
+down at the door leaf**.
 
-The *signal direction* the PRD describes is still correct, and
-`DOOR_OPEN_IS_FARTHER = false` is the right setting:
+- **Closed** — each beam clears the leaf and lands on whatever is beyond it, so every
+  sensor reads long.
+- **Opening** — the leaf swings into the beam and the reading **drops into the 0-20 cm
+  trip band**.
 
-- **Closed** — the beam clears the leaf and lands on the nearest wall or the
-  floor, so each sensor reads long (typically a few metres, or the
-  `DIST_MAX_CM` ≈ 431 cm ceiling if nothing is in range).
-- **Opening** — the swinging leaf cuts into the beam and the reading **drops**
-  sharply, to roughly where the leaf passes.
+`DOOR_OPEN_IS_FARTHER = false` is correct and the system works this way today.
+`THRESH_DEFAULT_CM` is 20 cm to match; the V5 slider overrides it on connect.
+PRD.md has been corrected to match — any older description of a jamb mount is gone.
 
-One consequence drives most of the finals work. Because the leaf *sweeps
-through* the beam rather than coming to rest in it, each sensor sees a
-**transient dip**, not a sustained state. The midterm rule requires all three
-sensors to read open simultaneously for `PERSIST_N = 3` consecutive 300 ms
-cycles — roughly **600–700 ms of continuous agreement**. A briskly opened door
-may not hold the beams that long, and because the three sensors sit along the
-top of the frame the leaf crosses them *sequentially*, so they may never all
-read open inside the same cycle.
-
-Whether this actually costs detections is an empirical question, and Tier 1
-exists partly to answer it: `tools/analyze.py` reports measured dip durations
-against that ~700 ms bar.
+**One consequence drives the Tier 3 work.** The leaf *sweeps through* the beam rather
+than coming to rest in it, so each sensor sees a **transient dip**, not a sustained
+state. The midterm rule needs all three sensors reading open simultaneously for
+`PERSIST_N = 3` consecutive 300 ms cycles — roughly **600-700 ms of continuous
+agreement** — and the leaf crosses the three sensors sequentially. Whether that costs
+detections is an empirical question; `tools/analyze.py` measures dip durations against
+that bar, and the baseline run answers it.
 
 ## Tiers
 
@@ -56,10 +49,14 @@ are compared against.
   (`tmask`, `risk`) are present from the start and read 0 until then, so the
   baseline capture and the final capture parse identically. **Append only; never
   reorder.**
-- **Ground-truth trial markers.** `1` before a door-opening trial, `0` before a
-  disturbance trial. The firmware chirps so whoever is at the door hears the
-  marker register. `tools/analyze.py` pairs each marker with what the system
-  then did, which produces the confusion matrix with no hand labelling.
+- **One-tap test trials**, on Blynk buttons **V8** (door-opening trial) and
+  **V9** (disturbance trial), and on serial `1` / `0`. A press clears any latch
+  from the previous trial, re-arms, logs the ground-truth marker and chirps two
+  high pips for "go". `tools/analyze.py` pairs each marker with what the system
+  then did, producing the confusion matrix with no hand labelling.
+  This is deliberately a single action so the whole battery can be run **solo
+  from the phone at the door** — you cannot press a laptop key and open the door
+  at the same moment.
 - **`tools/analyze.py`** — summary statistics, tidy CSV export, and the paper's
   figures. Parsing and statistics are stdlib; matplotlib is needed only for
   figures.

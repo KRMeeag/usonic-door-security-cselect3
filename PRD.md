@@ -86,21 +86,18 @@ finalized.
 This is the "why" behind each non-obvious decision — reuse this prose directly in the
 Methods/Discussion sections; it's the justification a reader or panel member will ask for.
 
-**8.1 Sensing geometry.** The three ultrasonic sensors are fixed to the door **frame/jamb** on
-the leaf side, spaced vertically ~50–60cm apart (roughly knee/chest/head height) and **angled
-across the doorway** so that with the door closed each beam clears the leaf edge and lands on
-the far wall / across the room — a large, stable baseline. When the door opens, the swinging
-leaf moves **into** each beam's path and intercepts it much closer to the sensor, so every
-reading **drops sharply below its baseline** — **door-open is a distance decrease.**
+**8.1 Sensing geometry.** The three ultrasonic sensors are mounted **on top of the
+door frame at roughly 45 degrees, aimed down at the door leaf**. With the door closed
+each beam clears the leaf and lands on whatever is beyond it — the nearest wall, the
+floor, or nothing in range — so every sensor reads long. As the door opens the leaf
+swings **into** the beam and intercepts it close to the sensor, so every reading
+**drops sharply** — **door-open is a distance decrease.**
 
-This matches how the sensors physically mount (taped flush to the jamb, no bracket or standoff
-needed) and puts the moving object being measured — the leaf itself — directly in the
-detection path. The known trade-off, carried into §14: anything else that crosses a beam (a
-person walking through, an object set down in the doorway) produces the same "closer" signal,
-which is why detection is gated on **all three** stacked beams agreeing plus a persistence
-count (§8.2, §11) rather than any single beam. The firmware keeps a
-`DOOR_OPEN_IS_FARTHER` switch for the inverse mount (sensor facing the closed leaf at a
-~10-20cm standoff, where opening makes the reading increase) — set `false` for this build.
+A sensor reads open once its live distance falls to the trip threshold, which in this
+installation is **0-20 cm**. The known trade-off, carried into §14: anything else that
+crosses a beam produces the same "closer" signal, which is why detection is gated on
+**all three** beams agreeing plus a persistence count (§8.2, §11) rather than any
+single beam.
 
 If the far wall is beyond the sensor's ~4.3m range the closed-door beam returns no echo. The
 firmware handles this by reading the ECHO line's edges directly: a live sensor always asserts
@@ -123,8 +120,8 @@ other's echo readings.
 sensor's closed-door reading at arm time and framed the alarm as *deviation from that
 self-captured baseline* — workable for a sensor aimed at the closed leaf a fixed 10–20cm
 away, where the baseline is always a small, predictable number. It breaks down for the
-across-the-doorway mount actually built here (§8.1): the closed-door baseline is whatever
-happens to be across the room, anywhere from tens of centimetres to several metres, so a
+mount actually built here (§8.1): the closed-door reading is whatever happens to lie
+beyond the leaf, anywhere from tens of centimetres to several metres, so a
 deviation sized to be meaningful at one baseline is either swamped by real readings or
 triggered by noise at another — this was tried on the bench and confirmed unworkable.
 
@@ -170,19 +167,21 @@ never stalls the sensor loop.
 
 ## 9. Wiring & Pinout
 
-**Physical mounting (top-down view):**
+**Physical mounting (side view):**
 ```
-  CLOSED                                  OPEN
-  jamb ┌──────────────────  far wall      jamb ┌──────────────────  far wall
-  [S]══╪═══════════════════▶ ~200cm       [S]══╪══▶ ~35cm
-       │  (beam clears leaf)                   │ ╲ leaf swung INTO the beam
-   ────┘leaf│                              ────┘  ╲────  leaf
-           │(closed, beside sensor)                     (open)
+      top of door frame
+   ┌───[S1][S2][S3]───┐      sensors on the frame header, angled ~45 deg down
+   │      ╲  ╲  ╲     │
+   │       ╲  ╲  ╲    │      CLOSED: beams clear the leaf, land on the wall /
+   │ leaf   ╲  ╲  ╲   │              floor / nothing in range  -> reads LONG
+   │(closed) ╲  ╲  ╲  │
+   │          ▼  ▼  ▼ │      OPENING: the leaf swings INTO the beams and
+   └──────────────────┘               intercepts them  -> reads 0-20 cm
 ```
-Closed door: each beam misses the leaf and reads the far wall (large, stable baseline).
-Open door: the leaf swings into the beam and each reading **drops** well below baseline (§8.1).
-Sensors stack vertically ~50–60cm apart (knee/chest/head); firing order S1 → S2 → S3, ~60ms
-apart, repeating every 300ms. A far wall beyond the sensor's ~4.3m range is fine — the
+Closed door: each beam clears the leaf and reads long.
+Open door: the leaf swings into the beams and each reading **drops** into the trip
+band (§8.1). The three sit across the top of the frame; firing order S1 → S2 → S3,
+~60ms apart, repeating every 300ms. A far wall beyond the sensor's ~4.3m range is fine — the
 firmware reports it as a fixed ceiling (`DIST_MAX_CM`) and still arms; only a genuinely
 faulty sensor blocks arming (§8.1). `v` in the serial monitor shows which of the three:
 a cm value, `> 431 cm` (far, OK), or `FAULT`.
@@ -334,12 +333,10 @@ State these explicitly rather than leaving them implicit:
   have auto-calibrated at arm time, but that model didn't hold up for a mount whose baseline is
   an arbitrary far-wall distance (§8.3). Re-measure and re-set the slider if the sensors are
   remounted or the doorway changes.
-- **Beam-crossing ambiguity.** With the across-the-doorway mounting (§8.1), any object that
-  enters a beam — a person stepping through, something set down in the opening — produces the
-  same "closer" signal as the door leaf. The three-beam consensus plus persistence count
-  mitigates but does not eliminate this; a determined slow approach along all three beam
-  heights could still read as an opening. A depth/geometry check or pairing with the hinge-side
-  angle is the natural hardening step.
+- **Beam-crossing ambiguity.** Any object that enters a beam — a hand, a person passing
+  directly beneath the sensors — produces the same "closer" signal as the door leaf. The
+  three-beam consensus plus persistence count mitigates but does not eliminate this. A
+  cross-sensor timing/depth check is the natural hardening step.
 - Single entry point, no lock actuation, no camera/facial recognition — see §4 Non-Goals.
 
 ## 15. MVP Scope Cuts

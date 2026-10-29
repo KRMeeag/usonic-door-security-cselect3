@@ -4,25 +4,20 @@
 // A door alarm that only fires inside a user-armed window, so routine daily
 // entry/exit does not cause alert fatigue.
 //
-// Sensing geometry: 3 ultrasonic sensors mounted on the frame jamb, angled
-// across the doorway. Closed door -> the beam clears the leaf and lands on
-// the far wall, somewhere well beyond the trip distance. Opening leaf swings
-// INTO the beam -> the reading DROPS to roughly where the leaf now sits.
-// (Flip DOOR_OPEN_IS_FARTHER for the alternate mount: sensor facing the
-// closed leaf at ~10-20cm standoff, where opening makes the reading rise.)
-// The three are fired sequentially ~60 ms apart to avoid crosstalk.
+// Sensing geometry: 3 ultrasonic sensors on TOP of the door frame, angled
+// ~45 degrees down at the door leaf. Closed door -> the beam clears the leaf
+// and lands on the wall/floor/nothing beyond it, so the sensor reads long.
+// Opening leaf swings INTO the beam -> the reading DROPS into the trip band
+// (0-20 cm in this installation). The three are fired sequentially ~60 ms
+// apart to avoid crosstalk.
 //
-// Threshold, not deviation: V5 (`thresholdCm`) is an ABSOLUTE distance in cm —
-// physically measure how far the leaf is from a sensor when it's swung far
-// enough into the beam to count as "opening" (or the standoff gap for the
-// alternate mount), and set the slider to that. A sensor reads open once its
-// live distance crosses the threshold, full stop — no comparison to a
-// per-sensor baseline. This was a deliberate switch away from "deviation from
-// an auto-captured baseline": across a doorway the closed-door baseline is
-// just whatever is across the room (tens of cm to several metres, entirely
-// installation-dependent), so a delta sized relative to it was either
-// swamped by real readings or arbitrary. An absolute, physically-measured
-// threshold is the more honest fit for this mount.
+// Threshold, not deviation: V5 (`thresholdCm`) is an ABSOLUTE distance in cm.
+// A sensor reads open once its live distance falls to or below it, full stop —
+// no comparison to a per-sensor baseline. This installation trips at 0-20 cm.
+// Deliberate switch away from "deviation from an auto-captured baseline": the
+// closed-door reading is just whatever lies beyond the leaf (tens of cm to
+// several metres, entirely installation-dependent), so a delta sized relative
+// to it was either swamped by real readings or arbitrary.
 //
 // Arm  : health-checks each sensor (median of 5) and sanity-checks that its
 //        closed-door reading doesn't already cross the threshold (door must
@@ -60,6 +55,8 @@
 #define VPIN_THRESH V5   // slider    — Trip distance in cm (PERSIST_N is a constant)
 #define VPIN_SOUND  V6   // int 0/1   — noise detected since the last push (~1 s window)
 #define VPIN_ALARM  V7   // int 0/1   — alarm latched (solid; pairs with V4)
+#define VPIN_TRIAL_P V8  // button    — start a door-opening test trial (Req 6)
+#define VPIN_TRIAL_N V9  // button    — start a disturbance test trial (Req 6)
 
 // (GPIO map lives in include/pins.h)
 
@@ -79,20 +76,13 @@ static const float    DIST_MAX_CM      = ECHO_MAX_US / 58.0f;  // ~431 cm — th
 static const uint8_t  BASELINE_SAMPLES = 5;       // readings per sensor at arm time -> median
 static const uint8_t  PERSIST_N        = 3;       // consecutive all-open cycles -> alarm (~0.9 s)
 
-// Mounting geometry / threshold direction. false = this build: sensor angled
-// across the doorway, closed door reads the far wall, an opening leaf swings
-// into the beam so the reading FALLS -> door-open = dist <= thresholdCm.
-// This is the mount that's actually wired and bench-verified — do not flip
-// this without also remounting the sensors to the alternate standoff below.
-// true = alternate mount: sensor faces the closed leaf at ~10-20cm standoff,
-// opening makes the reading RISE -> door-open = dist >= thresholdCm.
+// Threshold direction. false = this build: sensors on top of the frame angled
+// down at the leaf, closed door reads long, an opening leaf swings into the
+// beam so the reading FALLS -> door-open = dist <= thresholdCm. This is the
+// mount that is wired and working. SETTLED — do not flip it.
 static const bool     DOOR_OPEN_IS_FARTHER = false;
 
-// thresholdCm is an ABSOLUTE distance, physically measured at install time —
-// not a deviation from a baseline. Pick values that bracket "how far is the
-// leaf from a sensor once it's swung far enough into the beam to count as
-// open" for this mount (or the standoff gap for the alternate mount).
-static const float    THRESH_DEFAULT_CM = 30.0f;   // until the V5 slider syncs; re-measure per install
+static const float    THRESH_DEFAULT_CM = 20.0f;   // trip band is 0-20 cm; V5 overrides on connect
 static const float    THRESH_MIN_CM     = 5.0f;
 static const float    THRESH_MAX_CM     = 200.0f;
 
@@ -204,6 +194,36 @@ void logSample(bool sound) {
                 sound ? 1 : 0, (unsigned long)soundEventCount,
                 lastTempC, lastHumidity, dhtOk ? 1 : 0,
                 rssi, (unsigned long)ESP.getFreeHeap());
+}
+
+// --------------------------------------------------------------------------
+// Test trials  (finals Req 6)
+//
+// One button press runs a whole trial cycle: clear any latch left over from
+// the previous trial, re-arm, log the ground-truth marker, then chirp "go".
+//
+// This is what makes the test battery a ONE-PERSON job. You cannot press a
+// laptop key and open the door at the same moment, so the same action is
+// exposed on V8/V9 as Blynk buttons: stand at the door with the phone, tap,
+// wait for the double pip, open the door. One tap per trial.
+// --------------------------------------------------------------------------
+void startTrial(bool positive) {
+  if (armed || alarmed) disarm("trial");
+  doArm();
+  if (!armed) {                                  // refused — door open, or a fault
+    Serial.println("[trial] ARM REFUSED — check the door is shut, then tap again");
+    tone(PIEZO_PIN, 400, 400);                   // low buzz = not ready
+    currentToneHz = 0;
+    return;
+  }
+  csvEvent(positive ? "trial_pos" : "trial_neg");
+  Serial.printf("[trial] %s — go\n",
+                positive ? "POSITIVE (open the door)"
+                         : "NEGATIVE (disturbance only, door stays shut)");
+  tone(PIEZO_PIN, 2600, 70); delay(90);          // two high pips = armed and logged
+  tone(PIEZO_PIN, 2600, 70); delay(90);
+  noTone(PIEZO_PIN);
+  currentToneHz = 0;
 }
 
 // --------------------------------------------------------------------------
@@ -582,6 +602,14 @@ BLYNK_WRITE(VPIN_ARM) {
   else                    disarm("app");
 }
 
+BLYNK_WRITE(VPIN_TRIAL_P) {
+  if (param.asInt() == 1) startTrial(true);
+}
+
+BLYNK_WRITE(VPIN_TRIAL_N) {
+  if (param.asInt() == 1) startTrial(false);
+}
+
 BLYNK_WRITE(VPIN_THRESH) {
   float v = param.asFloat();
   if (v < THRESH_MIN_CM) v = THRESH_MIN_CM;
@@ -621,7 +649,8 @@ static const bool ALLOW_SERIAL_CONTROL = true;
 void diagHelp() {
   Serial.println(F("[cmd] p toggle bring-up view | v ping-burst  t self-test  b buzzer  m pinmap"));
   Serial.println(F("[cmd] a arm  d disarm  ? state  h help"));
-  Serial.println(F("[cmd] c toggle CSV log | 1 mark POSITIVE trial  0 mark NEGATIVE trial"));
+  Serial.println(F("[cmd] c toggle CSV log | 1 start OPEN-DOOR trial  0 start DISTURBANCE trial"));
+  Serial.println(F("[cmd] (trials are also on Blynk V8/V9 so they can be run solo from the phone)"));
 }
 
 void diagPinMap() {
@@ -687,23 +716,13 @@ void handleSerialControl() {
       case 'm': diagPinMap();    break;
       case 'h': diagHelp();      break;
 
-      // Ground-truth markers for the Req 6 test battery. Press immediately
-      // BEFORE each trial; tools/analyze.py pairs every marker with whatever
-      // the system did in the following window to build the confusion matrix
-      // with no hand labelling. The chirp is so whoever is at the door can
-      // hear that the marker registered.
-      case '1':
-        csvEvent("trial_pos");
-        Serial.println("[trial] POSITIVE marked — open the door now");
-        tone(PIEZO_PIN, 2600, 60);
-        currentToneHz = 0;                       // let serviceSiren reassert
-        break;
-      case '0':
-        csvEvent("trial_neg");
-        Serial.println("[trial] NEGATIVE marked — do the disturbance now");
-        tone(PIEZO_PIN, 1400, 60);
-        currentToneHz = 0;
-        break;
+      // Req 6 test battery. Same full cycle as the V8/V9 buttons — re-arm,
+      // log the ground-truth marker, chirp "go" — so the serial and phone
+      // paths produce identical data. tools/analyze.py pairs every marker
+      // with whatever the system then did, which builds the confusion matrix
+      // with no hand labelling.
+      case '1': startTrial(true);  break;
+      case '0': startTrial(false); break;
       case 'c':
         csvMode = !csvMode;
         Serial.printf("[serial] CSV log %s\n", csvMode ? "ON" : "OFF");
