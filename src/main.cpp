@@ -152,6 +152,61 @@ void disarm(const char *src);
 const char *stateString();
 
 // --------------------------------------------------------------------------
+// CSV data log  (finals Req 4 — record sensor readings and system events)
+//
+// Two machine-readable line types are interleaved with the human-readable
+// output on the same serial stream, so one capture file holds both:
+//   #D,...  one telemetry sample per CYCLE_MS
+//   #E,...  one discrete system event
+// A `#H,` header block is emitted at boot so a capture file is self-describing.
+//
+// Capture a run with:  pio device monitor -f log2file
+// then point tools/analyze.py at the resulting file.
+//
+// THE SCHEMA IS FROZEN. The midterm-baseline capture and the final capture
+// have to parse identically or the before/after comparison means nothing, so
+// fields that only become meaningful in a later tier (tmask, risk) are
+// present from the start and simply read 0 until then. Append new fields at
+// the END and bump LOG_SCHEMA; never reorder or remove one.
+// --------------------------------------------------------------------------
+static const int LOG_SCHEMA = 1;
+
+bool csvMode = true;             // 'c' toggles; ON by default so a run is never lost
+
+// One discrete event. `detail` must contain no comma and no newline.
+void csvEvent(const char *type, const char *detail = "") {
+  if (!csvMode) return;
+  Serial.printf("#E,%lu,%s,%s\n", (unsigned long)millis(), type, detail);
+}
+
+void csvHeader() {
+  Serial.printf("#H,V,%d,door-intrusion\n", LOG_SCHEMA);
+  Serial.println(F("#H,D,ms,state,armed,alarm,d1,d2,d3,hmask,omask,tmask,thr,streak,risk,snd,sndev,temp,hum,dhtok,rssi,heap"));
+  Serial.println(F("#H,E,ms,type,detail"));
+}
+
+// One telemetry sample; called at the end of every sensor cycle. hmask/omask
+// are per-sensor bitfields (bit i = sensor i+1) for healthy / reads-open.
+void logSample(bool sound) {
+  if (!csvMode) return;
+  unsigned hmask = 0, omask = 0, tmask = 0;
+  for (int i = 0; i < 3; i++) {
+    if (healthy[i])  hmask |= (1u << i);
+    if (openFlag[i]) omask |= (1u << i);
+  }
+  // tmask (per-sensor trigger latches) and risk arrive in Tier 3; 0 until then.
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  Serial.printf("#D,%lu,%s,%d,%d,%.1f,%.1f,%.1f,%u,%u,%u,%.1f,%u,%u,%d,%lu,%.1f,%.1f,%d,%d,%lu\n",
+                (unsigned long)millis(), stateString(), (int)armed, (int)alarmed,
+                dist[0], dist[1], dist[2],
+                hmask, omask, tmask,
+                thresholdCm, (unsigned)openStreak, 0u /* risk — Tier 3 */,
+                sound ? 1 : 0, (unsigned long)soundEventCount,
+                lastTempC, lastHumidity, dhtOk ? 1 : 0,
+                rssi, (unsigned long)ESP.getFreeHeap());
+}
+
+// --------------------------------------------------------------------------
 // Ultrasonic
 // --------------------------------------------------------------------------
 float medianOf(float *a, int n) {
@@ -280,6 +335,7 @@ void maybeWarn() {
   if (now - lastWarnMs < WARN_COOLDOWN_MS) return;
   lastWarnMs = now;
   Serial.println("[warn] door_noise_warning");
+  csvEvent("warn", "sound-no-door");
   if (Blynk.connected()) Blynk.logEvent("door_noise_warning");
 }
 
@@ -322,6 +378,12 @@ void sensorCycle() {
       alarmed    = true;                        // LATCHED
       sirenStart = millis();
       Serial.println("[ALARM] intrusion — all 3 sensors past threshold, sustained");
+      {
+        char d[48];
+        snprintf(d, sizeof(d), "d=%.0f/%.0f/%.0f thr=%.0f",
+                 dist[0], dist[1], dist[2], thresholdCm);
+        csvEvent("alarm", d);
+      }
       raiseIntrusionEvent();
     } else if (sound && noneOpen) {
       maybeWarn();                              // warning tier — no siren
@@ -352,6 +414,8 @@ void sensorCycle() {
                   openFlag[0], openFlag[1], openFlag[2],
                   sound ? 1 : 0, openStreak, stateString());
   }
+
+  logSample(sound);
 }
 
 // --------------------------------------------------------------------------
@@ -433,7 +497,19 @@ void publishStatus() {
 // WiFi reconnect watchdog  (every NETCHECK_MS)
 // --------------------------------------------------------------------------
 void netWatchdog() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  static bool wasDown = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wasDown) {                                // log the recovery edge too
+      wasDown = false;
+      Serial.println("[net] WiFi back up");
+      csvEvent("wifi_up");
+    }
+    return;
+  }
+  if (!wasDown) {
+    wasDown = true;
+    csvEvent("wifi_down");
+  }
   static uint32_t lastKick = 0;
   uint32_t now = millis();
   if (now - lastKick < 15000) return;
@@ -455,6 +531,7 @@ void doArm() {
   Serial.println("[arm] capturing baseline — door must be shut");
   if (!captureBaseline()) {
     Serial.println("[arm] ABORTED — one or more sensors unhealthy");
+    csvEvent("arm_abort", "health-or-sanity-check-failed");
     if (Blynk.connected()) {
       Blynk.virtualWrite(VPIN_ARM, 0);          // bounce the switch back
       Blynk.virtualWrite(VPIN_STATE, "DISARMED");
@@ -467,6 +544,12 @@ void doArm() {
   persistArmed(true);
   armChirp();
   Serial.println("[arm] ARMED");
+  {
+    char d[48];
+    snprintf(d, sizeof(d), "b=%.0f/%.0f/%.0f thr=%.0f",
+             baseline[0], baseline[1], baseline[2], thresholdCm);
+    csvEvent("arm", d);
+  }
   if (Blynk.connected()) {
     Blynk.virtualWrite(VPIN_ARM, 1);             // keep the app switch in sync
     Blynk.virtualWrite(VPIN_STATE, "ARMED");
@@ -482,6 +565,7 @@ void disarm(const char *src) {
   persistArmed(false);
   if (wasActive) {
     Serial.printf("[disarm] by %s\n", src);
+    csvEvent("disarm", src);
     disarmChirp();
   }
   if (Blynk.connected()) {
@@ -504,10 +588,16 @@ BLYNK_WRITE(VPIN_THRESH) {
   if (v > THRESH_MAX_CM) v = THRESH_MAX_CM;
   thresholdCm = v;
   Serial.printf("[cfg] trip threshold = %.1f cm\n", thresholdCm);
+  {
+    char d[32];
+    snprintf(d, sizeof(d), "thr=%.1f", thresholdCm);
+    csvEvent("cfg", d);
+  }
 }
 
 BLYNK_CONNECTED() {
   Serial.println("[blynk] connected");
+  csvEvent("blynk_up");
   Blynk.syncVirtual(VPIN_THRESH);               // pull the slider value from the server
   Blynk.virtualWrite(VPIN_ARM,   armed ? 1 : 0);  // device (NVS) is the source of truth for armed
   Blynk.virtualWrite(VPIN_STATE, stateString());
@@ -531,6 +621,7 @@ static const bool ALLOW_SERIAL_CONTROL = true;
 void diagHelp() {
   Serial.println(F("[cmd] p toggle bring-up view | v ping-burst  t self-test  b buzzer  m pinmap"));
   Serial.println(F("[cmd] a arm  d disarm  ? state  h help"));
+  Serial.println(F("[cmd] c toggle CSV log | 1 mark POSITIVE trial  0 mark NEGATIVE trial"));
 }
 
 void diagPinMap() {
@@ -595,6 +686,30 @@ void handleSerialControl() {
       case 'b': diagBuzzer();    break;
       case 'm': diagPinMap();    break;
       case 'h': diagHelp();      break;
+
+      // Ground-truth markers for the Req 6 test battery. Press immediately
+      // BEFORE each trial; tools/analyze.py pairs every marker with whatever
+      // the system did in the following window to build the confusion matrix
+      // with no hand labelling. The chirp is so whoever is at the door can
+      // hear that the marker registered.
+      case '1':
+        csvEvent("trial_pos");
+        Serial.println("[trial] POSITIVE marked — open the door now");
+        tone(PIEZO_PIN, 2600, 60);
+        currentToneHz = 0;                       // let serviceSiren reassert
+        break;
+      case '0':
+        csvEvent("trial_neg");
+        Serial.println("[trial] NEGATIVE marked — do the disturbance now");
+        tone(PIEZO_PIN, 1400, 60);
+        currentToneHz = 0;
+        break;
+      case 'c':
+        csvMode = !csvMode;
+        Serial.printf("[serial] CSV log %s\n", csvMode ? "ON" : "OFF");
+        if (csvMode) csvHeader();
+        break;
+
       default: break;
     }
   }
@@ -669,6 +784,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[boot] Door Intrusion Detection");
+  csvHeader();
 
   for (int i = 0; i < 3; i++) {
     pinMode(TRIG_PIN[i], OUTPUT);
@@ -711,6 +827,7 @@ void setup() {
   timer.setInterval(NETCHECK_MS, netWatchdog);
 
   Serial.printf("[boot] ready — state %s\n", stateString());
+  csvEvent("boot", stateString());
   diagHelp();
 }
 
