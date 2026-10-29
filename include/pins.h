@@ -4,8 +4,9 @@
 // ===========================================================================
 // GPIO map — ESP32-S3-WROOM-1 (ESP32-S3-DevKitC-1)
 //
-// Shared by src/main.cpp (firmware) and src/hw_check.cpp (bring-up test) so the
-// wiring only has to be described in one place.
+// Single source of truth for the wiring, used by src/main.cpp. (Bring-up
+// checks used to live in a separate hw_check.cpp; they're now serial
+// commands in main.cpp — see diagHelp().)
 //
 // The S3 has no input-only pins — every GPIO is full bidirectional with
 // pull-ups/pull-downs. Pins below are picked from the universally-safe low

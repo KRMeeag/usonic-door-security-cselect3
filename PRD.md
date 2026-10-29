@@ -99,8 +99,8 @@ detection path. The known trade-off, carried into §14: anything else that cross
 person walking through, an object set down in the doorway) produces the same "closer" signal,
 which is why detection is gated on **all three** stacked beams agreeing plus a persistence
 count (§8.2, §11) rather than any single beam. The firmware keeps a
-`DOOR_OPEN_IS_FARTHER` switch for the inverse mount (sensor facing the closed leaf at ~15cm,
-where opening makes the reading increase) — set `false` for this build.
+`DOOR_OPEN_IS_FARTHER` switch for the inverse mount (sensor facing the closed leaf at a
+~10-20cm standoff, where opening makes the reading increase) — set `false` for this build.
 
 If the far wall is beyond the sensor's ~4.3m range the closed-door beam returns no echo. The
 firmware handles this by reading the ECHO line's edges directly: a live sensor always asserts
