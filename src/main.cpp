@@ -22,14 +22,16 @@
 // Arm  : health-checks each sensor (median of 5) and sanity-checks that its
 //        closed-door reading doesn't already cross the threshold (door must
 //        be shut).
-// Alarm: all 3 sensors must be past the threshold, sustained for PERSIST_N
-//        consecutive cycles. LATCHES until disarmed from the app.
+// Alarm: all 3 sensors past the threshold for PERSIST_N consecutive cycles,
+//        OR all 3 tripped inside the coincidence window (Tier 3). LATCHES
+//        until disarmed from the app.
 //        Piezo is capped at 3 minutes; the latched state stays visible.
 // Sound: LM393 DO is a WARNING tier only — never a precondition for the alarm
 //        (break-ins can be silent). Muted while the alarm is latched.
 //
 // Fully autonomous offline: non-blocking Blynk, millis-based BlynkTimer loop,
-// armed flag persisted to NVS. Siren still fires with no network; the intrusion
+// pings scheduled one per slot rather than behind delay(), armed flag
+// persisted to NVS. Siren still fires with no network; the intrusion
 // notification is queued and sent on reconnect.
 // ===========================================================================
 
@@ -40,6 +42,7 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <esp_system.h>   // esp_reset_reason()
+#include <esp_timer.h>    // esp_timer_get_time() — ISR-safe clock for the sound edge counter
 #include <BlynkSimpleEsp32.h>
 #include <DHT.h>
 
@@ -137,6 +140,20 @@ static const uint8_t  EVENT_MAX_PER_HR = 20;     // hard cap on Blynk notificati
                                                  // rate-limits and SILENTLY DROPS the excess
 static const uint8_t  EVQ_N            = 12;     // offline notification ring depth
 
+// --- Tier 4: non-blocking sensing ----------------------------------------
+//
+// The midterm cycle pinged all three sensors back to back with two blocking
+// delay(PING_GAP_MS) calls between them, stalling the UI tick, Blynk and
+// sound sampling for ~120 ms (plus the pings themselves) every 300 ms. The
+// pings are now scheduled one per slot from loop(). Timing is deliberately
+// UNCHANGED — S1, S2 60 ms after S1 finishes, S3 60 ms after that, one
+// decision per CYCLE_MS round — so the persistence rule means the same number
+// of milliseconds it always did and captures stay comparable.
+static const uint32_t SOUND_REFRACTORY_US = 50000;  // one sound event per 50 ms at most —
+                                                    // a knock chatters the comparator
+static const float    US_PER_CM_FIXED  = 58.0f;    // midterm constant (~345 m/s, ~22 C)
+static const bool     TEMP_COMPENSATE  = true;     // speed of sound from the DHT11
+
 static const uint16_t BLINK_FAST_MS    = 100;    // LED1-3 door-open, LED5 alarm
 static const uint16_t BLINK_SLOW_MS    = 400;    // LED5 armed
 
@@ -163,7 +180,7 @@ bool     soundSinceCycle   = false;    // set in uiTick, consumed by sensorCycle
 bool     soundSincePublish = false;    // set in uiTick, consumed by publishStatus (V6)
 bool     soundActive       = false;    // stretched view, drives LED4
 uint32_t soundLedUntil     = 0;
-uint32_t soundEventCount   = 0;        // cumulative rising edges (diag view)
+uint32_t soundEventCount   = 0;        // cumulative debounced DO events, from the ISR (log + diag)
 
 float lastTempC     = NAN;
 float lastHumidity  = NAN;
@@ -202,6 +219,14 @@ uint8_t  riskScore     = 0;            // 0-100, SHADOW: reported, never trigger
 uint32_t lastSoundMs   = 0;
 uint32_t lastPreAlarmMs = 0;
 uint32_t lastWarnMs = 0;
+
+// Tier 4 state
+uint8_t  pingIdx   = 3;                // next sensor to ping; 3 = idle until the next round
+uint32_t pingDueUs = 0;                // when that ping's slot opens
+bool     envDue    = false;            // DHT read waiting for the round to finish
+volatile uint32_t soundIsrEdges  = 0;  // debounced active DO edges, counted in the ISR
+volatile uint32_t soundIsrLastUs = 0;
+float    usPerCm   = US_PER_CM_FIXED;  // round-trip us per cm; follows the DHT11 temperature
 
 // --------------------------------------------------------------------------
 // Forward declarations
@@ -394,13 +419,35 @@ float pingCm(int i) {
   while (digitalRead(ECHO_PIN[i]) == HIGH) {            // measure the echo pulse
     if (micros() - rise > ECHO_MAX_US) return DIST_MAX_CM;  // nothing in range -> report the ceiling
   }
-  return (micros() - rise) / 58.0f;                     // 58 us per cm, round trip
+  float cm = (micros() - rise) / usPerCm;               // round trip, temperature-compensated
+  return (cm < DIST_MAX_CM) ? cm : DIST_MAX_CM;         // keep the ceiling a fixed sentinel
+}
+
+// Speed of sound from the DHT11 (called after every environment read). The
+// midterm divided by a fixed 58 us/cm, which is only right at ~22 C. Indoors
+// here it is usually 28-32 C, where that constant reads about 1-2% short.
+// At the 20 cm trip point that is ~0.3 cm, so this is a correctness fix, not
+// a detection improvement — but it is the one place the DHT11 now feeds the
+// measurement the alarm decides on. No usable reading -> the midterm constant.
+void updateSoundSpeed() {
+  if (!TEMP_COMPENSATE || isnan(lastTempC)) { usPerCm = US_PER_CM_FIXED; return; }
+  float t = lastTempC;
+  if (t < 0.0f)  t = 0.0f;                              // DHT11's rated range
+  if (t > 50.0f) t = 50.0f;
+  float c = 331.3f + 0.606f * t;                        // m/s, dry air
+  usPerCm = 20000.0f / c;                               // 2 cm of path per cm, at c * 1e-4 cm/us
 }
 
 // Health-gate + closed-door sanity check for all three sensors. Returns false
 // if any sensor is unhealthy, OR its closed-door reading already crosses the
 // threshold (arming would immediately read that channel as "open").
 bool captureBaseline() {
+  // Arming owns the sensors while it runs: drop any half-finished round so the
+  // next decision sees three fresh readings, and leave the anti-crosstalk gap
+  // after whatever the scheduler pinged last (it may be this same sensor, with
+  // its ECHO still high).
+  pingIdx = 3;
+  delay(PING_GAP_MS);
   bool ok = true;
   for (int i = 0; i < 3; i++) {
     float s[BASELINE_SAMPLES];
@@ -581,25 +628,67 @@ void persistAlarmed(bool v) {
 }
 
 // --------------------------------------------------------------------------
-// Main sensor + decision cycle  (every CYCLE_MS)
+// Ping scheduler  (Tier 4)
+//
+// startRound() fires every CYCLE_MS and pings S1 on the tick itself;
+// servicePings() runs on every loop() pass and fires the next ping once its
+// slot is due, so the gaps between pings are free for the UI tick, Blynk and
+// the serial console instead of being spent in delay(). The order and spacing
+// are exactly the midterm's: S1, then S2 PING_GAP_MS after S1's ping returns,
+// then S3 the same, and the decision runs once, on three fresh readings,
+// after S3.
+//
+// Nothing slower than a ping may run between two pings of a round. Uneven
+// sample spacing costs detections: a fast sweep's dip can fall into the one
+// stretched gap and be missed (host simulation: ~2% of fast sweeps, when the
+// 25 ms DHT11 read was allowed to land mid-round). So the DHT read waits for
+// the round to finish — which is where the midterm ran it anyway.
+// --------------------------------------------------------------------------
+void sensorCycle();
+void readEnvironment();
+
+void readSensor(int i) {
+  float d = pingCm(i);
+  healthy[i] = (d > 0.0f);
+  if (healthy[i]) {
+    dist[i] = d;
+    // absolute threshold, not baseline deviation — see header comment
+    openFlag[i] = DOOR_OPEN_IS_FARTHER ? (d >= thresholdCm)   // leaf swings out of beam
+                                        : (d <= thresholdCm); // leaf swings into beam (this build)
+  } else {
+    openFlag[i] = false;                        // an unhealthy sensor cannot vote "open"
+  }
+}
+
+void servicePings() {                           // every loop() pass
+  if (pingIdx >= 3 || (int32_t)(micros() - pingDueUs) < 0) return;
+  readSensor(pingIdx++);
+  if (pingIdx < 3) {
+    pingDueUs = micros() + PING_GAP_MS * 1000UL;  // sequential firing, anti-crosstalk
+    return;
+  }
+  sensorCycle();
+  if (envDue) { envDue = false; readEnvironment(); }
+}
+
+void startRound() {                             // every CYCLE_MS
+  if (pingIdx < 3) return;                      // last round still in flight — never overlap two
+  pingIdx   = 0;
+  pingDueUs = micros();
+  servicePings();                               // S1 on the tick, as the midterm cycle did
+}
+
+void environmentTick() {                        // every DHT_MS
+  if (pingIdx < 3) envDue = true;               // mid-round: run it after the decision instead
+  else             readEnvironment();
+}
+
+// --------------------------------------------------------------------------
+// Decision cycle  (once per CYCLE_MS round, after the third ping)
 // --------------------------------------------------------------------------
 void sensorCycle() {
   bool sound = soundSinceCycle;
   soundSinceCycle = false;
-
-  for (int i = 0; i < 3; i++) {
-    if (i) delay(PING_GAP_MS);                  // sequential firing, anti-crosstalk
-    float d = pingCm(i);
-    healthy[i] = (d > 0.0f);
-    if (healthy[i]) {
-      dist[i] = d;
-      // absolute threshold, not baseline deviation — see header comment
-      openFlag[i] = DOOR_OPEN_IS_FARTHER ? (d >= thresholdCm)   // leaf swings out of beam
-                                          : (d <= thresholdCm); // leaf swings into beam (this build)
-    } else {
-      openFlag[i] = false;                      // an unhealthy sensor cannot vote "open"
-    }
-  }
 
   bool allHealthy = healthy[0] && healthy[1] && healthy[2];
 
@@ -716,20 +805,35 @@ void sensorCycle() {
 // --------------------------------------------------------------------------
 // UI tick — LEDs, siren, sound sampling  (every UI_MS)
 // --------------------------------------------------------------------------
+// LM393 DO edge (Tier 4). The midterm only polled the pin every UI_MS, and not
+// at all while the cycle sat in delay(), so a knock shorter than the poll
+// period was simply missed. The interrupt sees every edge; the refractory
+// period folds a chattering comparator burst back into one event, which is
+// the same one-per-50-ms ceiling the poll had.
+void IRAM_ATTR soundIsr() {
+  uint32_t now = (uint32_t)esp_timer_get_time();
+  if (now - soundIsrLastUs >= SOUND_REFRACTORY_US) {
+    soundIsrLastUs = now;
+    soundIsrEdges++;
+  }
+}
+
 void uiTick() {
   uint32_t now = millis();
 
+  // Sound = DO still active now, OR the ISR caught a pulse since the last tick.
+  static uint32_t seenEdges = 0;
+  uint32_t edges = soundIsrEdges;                 // aligned 32-bit read is atomic
   int  raw = digitalRead(SOUND_DO_PIN);
-  bool s   = SOUND_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
+  bool s   = (SOUND_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH)) || (edges != seenEdges);
+  soundEventCount += edges - seenEdges;           // debounced events, for the log and diag line
+  seenEdges = edges;
   if (s) {
     soundSinceCycle   = true;
     soundSincePublish = true;
     soundLedUntil      = now + SOUND_LED_HOLD_MS;
     lastSoundMs        = now;                   // feeds the risk score's sound term
   }
-  static bool lastS = false;
-  if (s && !lastS) soundEventCount++;             // rising edge, for the diag line
-  lastS = s;
   soundActive = (now < soundLedUntil);
 
   bool bf = (now / BLINK_FAST_MS) & 1;
@@ -783,6 +887,7 @@ void readEnvironment() {
     csvEvent("dht_stale");
     Serial.println("[env] DHT stale — readings invalidated");
   }
+  updateSoundSpeed();                             // stale -> back to the fixed constant
   if (!diagMode)                                  // diag view carries t/h on its status line
     Serial.printf("[env] t=%.1f C  h=%.0f %%%s\n", lastTempC, lastHumidity,
                   dhtOk ? "" : "   (DHT read failed)");
@@ -867,8 +972,8 @@ void doArm() {
   Serial.println("[arm] ARMED");
   {
     char d[48];
-    snprintf(d, sizeof(d), "b=%.0f/%.0f/%.0f thr=%.0f",
-             baseline[0], baseline[1], baseline[2], thresholdCm);
+    snprintf(d, sizeof(d), "b=%.0f/%.0f/%.0f thr=%.0f sos=%.1f",
+             baseline[0], baseline[1], baseline[2], thresholdCm, 20000.0f / usPerCm);
     csvEvent("arm", d);
   }
   if (Blynk.connected()) {
@@ -1047,6 +1152,13 @@ void diagStatus() {
                 (unsigned long)soundEventCount);
   if (dhtStale) Serial.println(F("  env        STALE        DHT not reporting"));
   else          Serial.printf("  env        %.1f C / %.0f %%\n", lastTempC, lastHumidity);
+  {
+    char sb[16];
+    snprintf(sb, sizeof(sb), "%.1f m/s", 20000.0f / usPerCm);
+    Serial.printf("  ranging    %-12s %s\n", sb,
+                  (TEMP_COMPENSATE && !isnan(lastTempC)) ? "speed of sound from the DHT11"
+                                                         : "fixed 58 us/cm (no DHT reading)");
+  }
   Serial.printf("  net        wifi=%-9s blynk=%-7s queued=%u dropped=%u\n",
                 netEnabled ? (WiFi.status() == WL_CONNECTED ? "up" : "down") : "OFF",
                 (netEnabled && Blynk.connected()) ? "up" : "down",
@@ -1087,6 +1199,7 @@ void diagSelfTest() {
 // Verbose per-sensor ping — distinguishes faulty from out-of-range.
 void diagPingBurst() {
   Serial.println(F("[in ] ping burst:"));
+  delay(PING_GAP_MS);                            // clear of the scheduler's last ping
   for (int i = 0; i < 3; i++) {
     float d = pingCm(i);
     if (d < 0.0f)
@@ -1315,6 +1428,8 @@ void setup() {
     pinMode(ECHO_PIN[i], INPUT);                // divider holds the level; no internal pull needed
   }
   pinMode(SOUND_DO_PIN, INPUT_PULLUP);          // back up the module's onboard pull-up (DO is active-low)
+  attachInterrupt(digitalPinToInterrupt(SOUND_DO_PIN), soundIsr,
+                  SOUND_ACTIVE_LOW ? FALLING : RISING);   // catches pulses shorter than the UI tick
   for (int i = 0; i < 5; i++) {
     pinMode(LED_PIN[i], OUTPUT);
     digitalWrite(LED_PIN[i], LOW);
@@ -1348,9 +1463,9 @@ void setup() {
     else Serial.println("[boot] baseline incomplete — still ARMED (faulty sensors won't trip)");
   }
 
-  timer.setInterval(CYCLE_MS,    sensorCycle);
+  timer.setInterval(CYCLE_MS,    startRound);    // pings run from servicePings() in loop()
   timer.setInterval(UI_MS,       uiTick);
-  timer.setInterval(DHT_MS,      readEnvironment);
+  timer.setInterval(DHT_MS,      environmentTick);  // deferred while a round is in flight
   timer.setInterval(PUBLISH_MS,  publishStatus);
   timer.setInterval(NETCHECK_MS, netWatchdog);
 
@@ -1367,4 +1482,5 @@ void loop() {
   handleSerialControl();                           // TEST AID — see ALLOW_SERIAL_CONTROL
   if (netEnabled && WiFi.status() == WL_CONNECTED) Blynk.run();  // gated: an offline run() must not stall the loop
   timer.run();
+  servicePings();                                  // one ping per pass, never a delay()
 }

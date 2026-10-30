@@ -49,6 +49,7 @@ one. Each completed tier is tagged.
 | 1 | Baseline tagging, CSV logging, analysis script, Blynk console features | 1, 3, 4 | `tier1` |
 | 2 | Desk-verifiable safeguards and dashboard controls | 5, part of 3 | `tier2` |
 | 3 | Coincidence window, risk score | 2, 7 | `tier3` |
+| 4 | Non-blocking ping scheduler, interrupt sound capture, DHT11 speed-of-sound compensation | 5 | not yet — tag after the bench check |
 | — | Test battery, run against `midterm` and against the final build | 6 | — |
 
 `midterm` tags the firmware as presented, and is the baseline the final numbers
@@ -147,6 +148,58 @@ depends on an empirical fact about this rig — whether a fast sweep really does
 fail the persistence rule. If `detections gained` comes back 0, that is a real
 negative result and should be reported as one; the paper then leans on the
 Tier 2 reliability improvements, which are deterministic.
+
+## Tier 4 — delivered (branch `develop/v4`)
+
+The three findings the self-audit left open. **None of them changes a detection
+verdict** — see the verification below — so a capture taken before or after this
+tier answers the Tier 3 question the same way.
+
+| # | Change | What it fixes |
+| --- | --- | --- |
+| 1 | Pings scheduled one per slot from `loop()` instead of behind two `delay(PING_GAP_MS)` calls | The cycle spent ~120 ms of every 300 ms in `delay()`, plus the pings, stalling the UI tick, Blynk and the serial console. Longest `loop()` pass in steady state: **195 ms → 42 ms** (one ping plus, at most, one DHT read) |
+| 2 | LM393 DO counted by an edge interrupt with a 50 ms refractory period | The 50 ms poll missed any pulse shorter than its period, and every pulse during the blocking stretch. Short knocks now reach the warning tier, V6 and the risk score's sound term |
+| 3 | DHT11 temperature sets the speed of sound used in ranging | The fixed 58 µs/cm is only right at ~22 °C. At 30 °C it reads ~1.3% short. The DHT11 was the one rubric sensor that fed no decision; it now feeds the distance the decision is made on |
+
+**Timing is deliberately unchanged.** S1 fires on the cycle tick, S2 60 ms after S1's
+ping returns, S3 the same, and one decision runs per 300 ms round on three fresh
+readings, exactly as the midterm did. A faster cadence is now a one-constant change
+(`CYCLE_MS`), but it would change how many milliseconds `PERSIST_N` cycles stands for,
+so it must not change mid-battery. The 25 ms DHT11 read is held until the round
+finishes. In simulation, letting it land between two pings stretched one sample gap
+and cost ~2% of the fastest sweeps.
+
+**Compensation, honestly sized.** `c = 331.3 + 0.606·T` m/s, dry air; humidity is
+ignored (worth ~0.4% at 30 °C, 80% RH). At the 20 cm trip point the correction is
+~0.3 cm across the indoor range, so it is a **correctness fix, not a detection
+improvement**. With no usable DHT reading it falls back to the midterm constant. `?`
+shows the speed in use on a `ranging` line, and each `arm` event carries it as
+`sos=`. Off switch: `TEMP_COMPENSATE`.
+
+**`sndev` changed meaning.** It now counts debounced interrupt events rather than
+polled rising edges, so it reads higher than in a pre-Tier-4 capture of the same
+noise. Do not compare `sndev` across that boundary.
+
+**Verified on the host, not compiled for the ESP32.** `main.cpp` was built natively
+against stubbed Arduino / Blynk / DHT APIs on a virtual clock. The stubs model HC-SR04
+echo timing from speed-of-sound physics and deliver sound-pin edges as interrupts.
+Both the `tier3` firmware and this one ran the same 150 randomised batteries, 4,800
+trials in all: fast sweeps of random dip length, stagger and direction, held panels,
+and one-beam, two-beam, hand-wave and knock negatives. **Every trial got the same
+verdict and the same alarm attribution from both firmwares.** The same harness
+shows:
+
+| Measure | `tier3` | Tier 4 |
+| --- | --- | --- |
+| longest `loop()` pass, steady state | 195 ms | 42 ms |
+| UI tick gap, p99 | 220 ms | 67 ms |
+| sound events counted, out of 260 (2-120 ms pulses, chattering bursts) | 80 | 260 |
+| minimum spacing between any two pings | 77 ms | 77 ms |
+| sample cadence | 300 ms | 300 ms |
+| reading at a true 20.0 cm, 30 °C / 35 °C | 19.7 / 19.6 cm | 20.0 / 20.0 cm |
+
+The cross-compile still has to be confirmed with `pio run` (see Hardware Handoff §J);
+the build sandbox could not reach the PlatformIO registry.
 
 ## Standalone operation
 

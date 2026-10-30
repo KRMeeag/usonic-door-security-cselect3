@@ -404,8 +404,10 @@ def report(sessions, trials, out=sys.stdout):
           f" (<= {cyc:.0f} ms) — at or below the sampling\n"
           f"  resolution, so those are a measurement floor and not a real\n"
           f"  duration. A high count means the sweep is faster than the sensor\n"
-          f"  loop can see, and the round-robin ping change (Tier 4) becomes\n"
-          f"  necessary rather than optional.\n")
+          f"  round can resolve. Tier 4 made the round non-blocking but kept\n"
+          f"  its {cyc:.0f} ms cadence on purpose, so PERSIST_N cycles means the\n"
+          f"  same milliseconds in every capture. Shortening CYCLE_MS is now a\n"
+          f"  one-constant change — but never mid-battery.\n")
 
     # ---- stability -------------------------------------------------------
     w("\n" + "-" * 78 + "\n")

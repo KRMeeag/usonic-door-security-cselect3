@@ -3,9 +3,9 @@
 Context package for whoever is drafting the paper. **Not committed**
 (gitignored). Updated as tiers land.
 
-> **Status as of this writing: Tiers 1 and 2 complete. Tier 3 not started.**
-> Nothing below marked *planned* exists yet. Do not write it up as done, and do
-> not report any number that has not actually been measured.
+> **Status as of this writing: Tiers 1–4 are built. The hardware test battery
+> (HARDWARE_HANDOFF §I) has not been run yet**, so there are no measured results.
+> Do not report any number that has not actually been measured on the rig.
 
 ---
 
@@ -102,10 +102,10 @@ than one that only lists new features.
 | --- | --- |
 | A latched alarm does not survive a power cut — `armed` is restored from NVS but `alarmed` is hardcoded false on boot, so cutting power silences the siren. Contradicts the PRD's own §8.5 reasoning. | **Fixed in Tier 2** |
 | One dead sensor silently disables the alarm — an unhealthy sensor is forced to "not open", and the alarm needs all three, so one unplugged ECHO makes the system permanently unable to fire while still displaying `ARMED`. Fail-silent, not fail-safe. | **Fixed in Tier 2** |
-| About 40% of each cycle is spent in blocking `delay()` for anti-crosstalk spacing, stalling the UI, networking and sound polling in 120 ms blocks. | Tier 4, conditional |
-| The sound sensor is polled every 50 ms and not at all during ping delays, so short LM393 pulses are undercounted. | Tier 4, conditional |
+| About 40% of each cycle is spent in blocking `delay()` for anti-crosstalk spacing, stalling the UI, networking and sound polling in 120 ms blocks. | **Fixed in Tier 4** |
+| The sound sensor is polled every 50 ms and not at all during ping delays, so short LM393 pulses are undercounted. | **Fixed in Tier 4** |
 | The offline event queue is one bit deep, so two offline alarms collapse into one notification and warnings are not queued at all. | **Fixed in Tier 2** |
-| The DHT11 contributes to no decision — it is a rubric-required sensor used only as telemetry. | Open |
+| The DHT11 contributes to no decision — it is a rubric-required sensor used only as telemetry. | **Addressed in Tier 4**: it sets the speed of sound for ranging (small effect, see §6c) |
 
 ---
 
@@ -144,18 +144,65 @@ measurement is of the midterm system and not of something subtly different.
 
 ---
 
-## 6. Planned, not yet built
+## 6. What Tier 3 delivered (built; results not yet measured)
 
-Write none of this as done.
+The design can be written up as done. Every result it implies still waits on
+the hardware run. Full detail is in `docs/FINALS.md` under Tier 3.
 
-**Tier 3 — the algorithm and the advanced feature.** Replace
-persistence-of-simultaneity with a **coincidence window**: each sensor latches a
-trigger with a short time-to-live, and the alarm fires when all three latches
-are live at once. That matches a transient signal, where the midterm rule does
-not. On top of it, a **0–100 risk score** fusing beam count, window fill, dip
-depth, sound recency and time armed — the required advanced feature. It will run
-in *shadow mode* first: computed and logged but not triggering, so its behaviour
-can be characterised against real data before it controls anything.
+**The coincidence window (Req 2).** Each sensor latches its own trigger with a
+time-to-live (default 1200 ms). The window rule fires when all three latches are
+live at once. That fits a transient sweep; the midterm rule needs ~600-700 ms of
+continuous three-beam agreement. The two rules are **OR-ed**, so the midterm
+behaviour is a strict subset: detection cannot get worse, and only the
+false-positive count can.
+
+**One run gives the before/after.** Both rules are evaluated every cycle,
+including after the latch, and what each *would* have done is logged. The
+`rule comparison` block in `analyze.py` therefore compares the old rule and the
+new on the same trials. Say so in Methods: it is a paired comparison on
+identical inputs, not two sessions.
+
+**The risk score (Req 7), in shadow mode.** A 0-100 weighted fusion of beams
+open now, beams latched in the window, persistence progress, depth past the
+threshold, and sound in the last 30 s. The weights sum to exactly 100 and are
+tabled in FINALS. It is published and logged but **never triggers the alarm**;
+crossing 30 raises a `pre_alarm` notification only. The design dropped the
+earlier *time armed* term, so do not list it.
+
+---
+
+## 6c. What Tier 4 delivered (done, safe to write up)
+
+Closes three of the §4 self-audit findings. **No detection verdict changes**,
+which matters for the paper: the Tier 3 comparison means the same thing on
+either side of this tier.
+
+1. **Non-blocking sensing.** The three pings used to run back to back behind two
+   blocking 60 ms delays. They are now scheduled one per slot, with identical
+   order and spacing and one decision per 300 ms round, so the rest of the
+   firmware keeps running between them. Keeping the timing identical was a
+   deliberate choice: a faster cadence would change what "three consecutive
+   cycles" means in milliseconds and break comparability. One subtlety is worth
+   a sentence in Discussion. When the 25 ms DHT11 read was allowed to land
+   between two pings, the uneven sample spacing cost ~2% of the fastest sweeps
+   in simulation. Slow work now waits for the round to finish.
+2. **Interrupt-driven sound capture.** Short knocks the 50 ms poll used to miss
+   are counted, with a 50 ms refractory period so one chattering comparator
+   burst stays one event. In simulation the poll caught 80 of 260 pulses and the
+   interrupt caught all 260. Sound still never gates the alarm (§1); this only
+   affects the warning tier, V6 and the risk score's sound term.
+3. **DHT11 temperature compensation of the speed of sound.** The firmware used a
+   fixed 58 µs/cm, which is only right at ~22 °C. It now uses
+   c = 331.3 + 0.606·T m/s from the DHT11 reading and falls back to the constant
+   without one. This gives the DHT11 a role in the measurement the alarm
+   decides on, which answers the "telemetry only" finding. **Size it honestly:**
+   at the 20 cm trip point the correction is ~0.3 cm over the indoor range.
+
+**How it was verified.** The firmware source was compiled natively against
+stubbed hardware APIs on a virtual clock and run through 4,800 simulated trials
+alongside the Tier 3 firmware, with identical verdicts on every trial. That is
+a software verification. The simulated trials are **not** results and must
+not appear in Results.
 
 ---
 
@@ -229,7 +276,15 @@ can be reported without any extra instrumentation.
   If only one run gets done, report the final rate alone and say plainly that no
   baseline comparison was collected.
 - **Do not present synthetic self-test output as a result.** It is fabricated
-  test data for checking the analysis script.
+  test data for checking the analysis script. The same goes for the Tier 4 host
+  simulation: it verified the firmware logic, and its trial counts are not
+  measurements of the device.
+- **Do not claim temperature compensation improves detection.** It corrects the
+  distance by ~0.3 cm at the trip point. Call it a correctness fix that gives
+  the DHT11 a role in ranging, and stop there.
+- **Do not compare sound-event counts (`sndev`) across the Tier 4 boundary.**
+  The count changed from polled edges to debounced interrupt events, so the
+  same noise reads higher after it.
 - **Do not describe adaptive thresholds, anomaly detection, or machine learning.**
   None are being built. The advanced feature is a weighted risk score with a
   published coefficient table, which is more defensible anyway.

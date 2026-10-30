@@ -170,7 +170,7 @@ baseline is still recoverable.
 Flash with:
 
 ```sh
-git checkout finals
+git checkout develop/v4      # there is no `finals` branch; this build includes Tier 2
 pio run -t upload
 pio device monitor -f log2file
 ```
@@ -290,10 +290,11 @@ persistence 3 cycles, window 1200 ms.
 
 ## I.1 · Sanity check — 3 min
 
-- [ ] Press `?`. Two new lines should appear:
+- [ ] Press `?`. These lines should appear (`ranging` arrived with Tier 4, §J):
       ```
       window     1200    latches=000   would-fire: persistence=0 window=0
       risk       0       normal  (shadow — never triggers)
+      ranging    348.2 m/s    speed of sound from the DHT11
       ```
 - [ ] Press `2` (held), **hold** the panel across all three beams.
       → alarm. Serial reads `[ALARM] intrusion — fired by persistence` or
@@ -383,3 +384,46 @@ Two more datastreams and one more event:
 
 - [ ] Template → Events → new event, code exactly `pre_alarm`, type Warning.
       That is the 4th of 5 event slots.
+
+
+---
+---
+
+# Tier 4 — non-blocking sensing  *(do this first: §J.1 is a compile check)*
+
+~5 minutes, desk only, no cardboard needed except for one step. **Nothing in the
+§I procedure changes.** Tier 4 keeps the exact ping timing, and a host
+simulation gave identical verdicts to the Tier 3 build on 4,800 trials. So run
+§I on this build as written.
+
+## J.1 · Build — 1 min
+
+```sh
+git checkout develop/v4
+pio run -t upload
+pio device monitor -f log2file
+```
+
+- [ ] **It compiles.** This tier was verified with a native host build against
+      stubbed APIs. The cloud sandbox could not download the ESP32 toolchain,
+      so this is the first real cross-compile. If it fails, paste the error.
+      The likely suspects are the three ESP32-specific additions: the
+      `esp_timer.h` include, the `IRAM_ATTR` sound ISR and `attachInterrupt`.
+      `git checkout tier3` is the known-good fallback.
+
+## J.2 · Bench checks — 4 min
+
+- [ ] **Console is snappy.** Type `?` repeatedly while `[cyc]` lines scroll.
+      It should answer instantly, where before it could lag up to ~200 ms.
+- [ ] **Sound LED catches short taps.** Tap the table *lightly* near the LM393,
+      a short click rather than a bang. LED4 should flash for each tap, and
+      `events=` on the `?` `door` line should go up by one per tap, not several.
+      If it climbs by many per tap, the comparator is chattering for longer
+      than 50 ms: turn the module's pot down a little.
+- [ ] **Ranging uses the DHT.** `?` shows `ranging  3xx.x m/s  speed of sound
+      from the DHT11`. At room temperature here, expect about 346-351 m/s.
+- [ ] **Falls back without it.** Unplug the DHT11. After ~30 s, `dht_stale`
+      appears and `ranging` reads `344.8 m/s  fixed 58 us/cm (no DHT
+      reading)`. Plug it back in.
+- [ ] **Detection unchanged.** Press `2` and hold the panel in all three
+      beams: alarm, same as §I.1.
