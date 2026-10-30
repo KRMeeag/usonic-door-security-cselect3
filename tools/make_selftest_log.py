@@ -35,11 +35,15 @@ line("[boot] Door Intrusion Detection")      # human-readable noise, must be ign
 heap, sndev = 232000, 0
 state, armed, alarm, streak = "DISARMED", 0, 0, 0
 
+tmask = 0        # bits 0-2 live latches, bit 3 persistence fired, bit 4 window fired
+risk  = 0
+
 def sample(d, omask, snd=0):
     global heap
     heap -= random.randint(0, 3)
     line(f"#D,{ms},{state},{armed},{alarm},{d[0]:.1f},{d[1]:.1f},{d[2]:.1f},"
-         f"7,{omask},0,{THR:.1f},{streak},0,{snd},{sndev},28.4,61.0,1,-57,{heap}")
+         f"7,{omask},{tmask | omask},{THR:.1f},{streak},{risk},{snd},{sndev},"
+         f"28.4,61.0,1,-57,{heap}")
 
 def idle(n):
     global ms
@@ -58,9 +62,12 @@ for dip_cycles, cls in ((4,"held"),(3,"held"),(2,"fast"),(5,"held"),(4,"held"),
                         (1,"fast"),(3,"fast"),(4,"held"),(2,"fast"),(4,"held")):
     line(f"#E,{ms},trial_pos,{cls}")
     ms += CYC * random.randint(2, 4)          # human reaction before opening
+    risk = 88
+    tmask |= 0x10                      # the window rule always catches these
     for k in range(dip_cycles):
         sample([18 + random.gauss(0, 2) for _ in range(3)], 7)
         streak = min(streak + 1, 9)
+        if streak >= 3: tmask |= 0x08  # persistence only on the longer dips
         ms += CYC
         if streak >= 3 and not alarm:
             line(f"#E,{ms},alarm,d=18/19/17 thr=30")
@@ -73,11 +80,14 @@ for dip_cycles, cls in ((4,"held"),(3,"held"),(2,"fast"),(5,"held"),(4,"held"),
         line(f"#E,{ms},arm,b=280/281/279 thr=30")
         state, armed = "ARMED", 1
     streak = 0
+    tmask = 0
+    risk  = 0
     idle(5)
 
 # --- negative trials: single-beam waves, sound-only, partial pushes --------
 for kind in range(8):
     line(f"#E,{ms},trial_neg,neg")
+    risk = 22 + (kind % 3) * 6
     ms += CYC * 2
     if kind % 3 == 0:                          # one beam only
         for _ in range(3):

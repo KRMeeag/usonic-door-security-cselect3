@@ -64,6 +64,8 @@
 #define VPIN_SILENCE V13 // button    — silence the siren WITHOUT clearing the latch
 #define VPIN_HEAP    V14 // int       — free heap, bytes (soak / leak evidence)
 #define VPIN_HEALTH  V15 // int 0/1   — 1 = all three sensors healthy
+#define VPIN_RISK    V16 // int 0-100 — risk score (shadow: reported, never triggers)
+#define VPIN_WINDOW  V17 // slider ms — coincidence window length
 
 // (GPIO map lives in include/pins.h)
 
@@ -100,6 +102,31 @@ static const uint16_t SIREN_HI_HZ      = 1200;
 
 static const uint32_t WARN_COOLDOWN_MS = 60000;  // door_noise_warning rate limit
 static const uint16_t SOUND_LED_HOLD_MS = 250;   // stretch momentary DO pulses so LED4 is visible
+
+// --- Tier 3: coincidence window + risk score -----------------------------
+//
+// The persistence rule asks all three beams to read open AT THE SAME TIME for
+// `persistN` consecutive cycles — roughly 600-700 ms of continuous agreement.
+// The panel crosses the three beams in sequence, so a fast sweep can break all
+// three without ever satisfying that.
+//
+// The coincidence window asks a weaker, better-matched question: did each beam
+// trip at SOME point inside the last `windowMs`? Each sensor latches its own
+// trigger with a time-to-live; the rule closes when all three latches are
+// simultaneously live.
+//
+// The two rules are OR-ed, so midterm behaviour is a strict subset — detection
+// cannot get worse, only the false-positive count can. BOTH are evaluated every
+// cycle including after the latch, and what each WOULD have done is recorded
+// separately (tmask bits 3 and 4). One run therefore yields the before/after
+// comparison directly, with no second session on the old firmware.
+static const uint32_t WINDOW_DEFAULT_MS = 1200;
+static const uint32_t WINDOW_MIN_MS     = 300;
+static const uint32_t WINDOW_MAX_MS     = 4000;
+static const uint32_t SOUND_RECENT_MS   = 30000;  // "a bang just happened" horizon
+static const uint8_t  RISK_ELEVATED     = 30;     // band edges for the shadow score
+static const uint8_t  RISK_CRITICAL     = 70;
+static const uint32_t PREALARM_COOLDOWN_MS = 60000;
 
 // --- Tier 2 safeguards ---------------------------------------------------
 static const uint8_t  FAULT_CONFIRM_N  = 5;      // consecutive bad cycles before calling it a fault
@@ -164,6 +191,16 @@ bool     dhtStale    = false;
 bool     sirenMuted  = false;          // silenced by the user; latch stays set
 uint8_t  persistN    = PERSIST_N;      // V11 / serial 'N' — runtime-tunable
 bool     netEnabled  = true;           // serial 'w' — off = fully standalone, no WiFi/Blynk
+
+// Tier 3 state
+uint32_t windowMs      = WINDOW_DEFAULT_MS;  // V17 / serial 'W'
+uint32_t trigAt[3]     = {0, 0, 0};    // millis of each sensor's most recent open reading
+bool     liveLatch[3]  = {false, false, false};
+bool     altOldFired   = false;        // persistence rule reached threshold this arm cycle
+bool     altWinFired   = false;        // coincidence window closed this arm cycle
+uint8_t  riskScore     = 0;            // 0-100, SHADOW: reported, never triggers the alarm
+uint32_t lastSoundMs   = 0;
+uint32_t lastPreAlarmMs = 0;
 uint32_t lastWarnMs = 0;
 
 // --------------------------------------------------------------------------
@@ -213,19 +250,73 @@ void logSample(bool sound) {
   if (!csvMode) return;
   unsigned hmask = 0, omask = 0, tmask = 0;
   for (int i = 0; i < 3; i++) {
-    if (healthy[i])  hmask |= (1u << i);
-    if (openFlag[i]) omask |= (1u << i);
+    if (healthy[i])   hmask |= (1u << i);
+    if (openFlag[i])  omask |= (1u << i);
+    if (liveLatch[i]) tmask |= (1u << i);
   }
-  // tmask (per-sensor trigger latches) and risk arrive in Tier 3; 0 until then.
+  // tmask bits 0-2 = per-sensor trigger latch live. Bits 3 and 4 record what
+  // each rule WOULD have done this arm cycle, which is what makes the
+  // old-vs-new comparison derivable from a single run.
+  if (altOldFired) tmask |= 0x08;
+  if (altWinFired) tmask |= 0x10;
   int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
   Serial.printf("#D,%lu,%s,%d,%d,%.1f,%.1f,%.1f,%u,%u,%u,%.1f,%u,%u,%d,%lu,%.1f,%.1f,%d,%d,%lu\n",
                 (unsigned long)millis(), stateString(), (int)armed, (int)alarmed,
                 dist[0], dist[1], dist[2],
                 hmask, omask, tmask,
-                thresholdCm, (unsigned)openStreak, 0u /* risk — Tier 3 */,
+                thresholdCm, (unsigned)openStreak, (unsigned)riskScore,
                 sound ? 1 : 0, (unsigned long)soundEventCount,
                 lastTempC, lastHumidity, dhtOk ? 1 : 0,
                 rssi, (unsigned long)ESP.getFreeHeap());
+}
+
+// --------------------------------------------------------------------------
+// Risk score  (finals Req 7) — SHADOW MODE
+//
+// A 0-100 fusion of the evidence available each cycle. It is published,
+// logged and banded, but it does NOT gate the alarm: the siren is still
+// decided by the two rules above. Running it in shadow first means its
+// behaviour can be characterised against real data before it is ever given
+// authority, and it cannot break detection in the meantime.
+//
+// Weights are chosen so the terms sum to exactly 100 at maximum, and are
+// printed here so the paper can reproduce the table:
+//   beams open now        3 x 10 = 30
+//   beams latched in window 3 x 8 = 24
+//   persistence progress         = 20
+//   depth past the threshold     = 16
+//   recent sound                 = 10
+// --------------------------------------------------------------------------
+uint8_t computeRisk(bool soundRecent) {
+  uint16_t r = 0;
+  uint8_t openN = 0, liveN = 0;
+  for (int i = 0; i < 3; i++) {
+    if (openFlag[i])  openN++;
+    if (liveLatch[i]) liveN++;
+  }
+  r += openN * 10;
+  r += liveN * 8;
+
+  uint8_t p = persistN ? persistN : 1;
+  r += (openStreak >= p) ? 20 : (uint16_t)((20UL * openStreak) / p);
+
+  float minD = DIST_MAX_CM;
+  bool  haveD = false;
+  for (int i = 0; i < 3; i++)
+    if (healthy[i] && dist[i] < minD) { minD = dist[i]; haveD = true; }
+  if (haveD && thresholdCm > 0.0f && minD <= thresholdCm) {
+    float frac = (thresholdCm - minD) / thresholdCm;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    r += (uint16_t)(frac * 16.0f);
+  }
+
+  if (soundRecent) r += 10;
+  return (r > 100) ? 100 : (uint8_t)r;
+}
+
+const char *riskBand(uint8_t r) {
+  return (r >= RISK_CRITICAL) ? "CRITICAL" : (r >= RISK_ELEVATED ? "ELEVATED" : "normal");
 }
 
 // --------------------------------------------------------------------------
@@ -538,23 +629,59 @@ void sensorCycle() {
   bool noneOpen   = !openFlag[0] && !openFlag[1] && !openFlag[2];
   doorOpen = allOpen;
 
-  if (armed && !alarmed) {
+  // --- coincidence window -------------------------------------------------
+  uint32_t nowMs = millis();
+  for (int i = 0; i < 3; i++) {
+    if (openFlag[i]) trigAt[i] = nowMs;
+    liveLatch[i] = trigAt[i] && (nowMs - trigAt[i] <= windowMs);
+  }
+  bool coincidence = liveLatch[0] && liveLatch[1] && liveLatch[2];
+
+  // --- risk score (shadow — reported, never triggers) ----------------------
+  bool soundRecent = lastSoundMs && (nowMs - lastSoundMs <= SOUND_RECENT_MS);
+  riskScore = computeRisk(soundRecent);
+
+  if (armed) {
     openStreak = allOpen ? (openStreak + 1) : 0;
-    if (openStreak >= persistN) {
-      alarmed    = true;                        // LATCHED
-      sirenStart = millis();
-      sirenMuted = false;                       // a new alarm overrides a previous silence
-      persistAlarmed(true);                     // survives a power cut
-      Serial.println("[ALARM] intrusion — all 3 sensors past threshold, sustained");
-      {
-        char d[48];
-        snprintf(d, sizeof(d), "d=%.0f/%.0f/%.0f thr=%.0f",
-                 dist[0], dist[1], dist[2], thresholdCm);
-        csvEvent("alarm", d);
+
+    // Both rules are evaluated EVERY cycle, including after the latch, so the
+    // log records what each would have done on its own. Without this the
+    // first rule to fire would mask the other and the comparison would be
+    // biased toward whichever is faster.
+    if (openStreak >= persistN) altOldFired = true;
+    if (coincidence)            altWinFired = true;
+
+    if (!alarmed) {
+      if (altOldFired || altWinFired) {
+        alarmed    = true;                      // LATCHED
+        sirenStart = nowMs;
+        sirenMuted = false;                     // a new alarm overrides a previous silence
+        persistAlarmed(true);                   // survives a power cut
+        const char *by = altOldFired ? (altWinFired ? "both" : "persistence")
+                                     : "window";
+        Serial.printf("[ALARM] intrusion — fired by %s\n", by);
+        {
+          char d[72];
+          snprintf(d, sizeof(d), "by=%s d=%.0f/%.0f/%.0f thr=%.0f risk=%u",
+                   by, dist[0], dist[1], dist[2], thresholdCm, (unsigned)riskScore);
+          csvEvent("alarm", d);
+        }
+        raiseIntrusionEvent();
+      } else {
+        if (sound && noneOpen) maybeWarn();     // warning tier — no siren
+
+        // Pre-alarm: the shadow score crossing into ELEVATED. Notification
+        // only; it never latches and never sounds the siren.
+        if (riskScore >= RISK_ELEVATED &&
+            (lastPreAlarmMs == 0 || nowMs - lastPreAlarmMs > PREALARM_COOLDOWN_MS)) {
+          lastPreAlarmMs = nowMs;
+          char d[32];
+          snprintf(d, sizeof(d), "risk=%u", (unsigned)riskScore);
+          Serial.printf("[pre-alarm] risk %u (%s)\n", (unsigned)riskScore, riskBand(riskScore));
+          csvEvent("pre_alarm", d);
+          notify("pre_alarm");
+        }
       }
-      raiseIntrusionEvent();
-    } else if (sound && noneOpen) {
-      maybeWarn();                              // warning tier — no siren
     }
   }
 
@@ -598,6 +725,7 @@ void uiTick() {
     soundSinceCycle   = true;
     soundSincePublish = true;
     soundLedUntil      = now + SOUND_LED_HOLD_MS;
+    lastSoundMs        = now;                   // feeds the risk score's sound term
   }
   static bool lastS = false;
   if (s && !lastS) soundEventCount++;             // rising edge, for the diag line
@@ -674,6 +802,7 @@ void publishStatus() {
   Blynk.virtualWrite(VPIN_ALARM, alarmed ? 1 : 0);
   Blynk.virtualWrite(VPIN_HEAP,   (uint32_t)ESP.getFreeHeap());
   Blynk.virtualWrite(VPIN_HEALTH, faultActive ? 0 : 1);
+  Blynk.virtualWrite(VPIN_RISK,   (int)riskScore);
   flushEventQueue();                            // at most one per tick
 }
 
@@ -730,6 +859,9 @@ void doArm() {
   armed      = true;
   alarmed    = false;
   openStreak = 0;
+  for (int i = 0; i < 3; i++) { trigAt[i] = 0; liveLatch[i] = false; }
+  altOldFired = altWinFired = false;            // fresh verdict for this arm cycle
+  lastPreAlarmMs = 0;
   persistArmed(true);
   armChirp();
   Serial.println("[arm] ARMED");
@@ -755,10 +887,18 @@ void disarm(const char *src) {
   persistArmed(false);
   persistAlarmed(false);
   if (wasActive) {
-    Serial.printf("[disarm] by %s\n", src);
-    csvEvent("disarm", src);
+    // Verdict for the arm cycle just ending: what each rule would have done on
+    // its own. This is the line tools/analyze.py turns into the old-vs-new
+    // detection comparison.
+    char v[48];
+    snprintf(v, sizeof(v), "old=%d win=%d risk=%u",
+             (int)altOldFired, (int)altWinFired, (unsigned)riskScore);
+    csvEvent("verdict", v);
+    Serial.printf("[disarm] by %s  (%s)\n", src, v);
     disarmChirp();
   }
+  altOldFired = altWinFired = false;
+  for (int i = 0; i < 3; i++) { trigAt[i] = 0; liveLatch[i] = false; }
   if (Blynk.connected()) {
     Blynk.virtualWrite(VPIN_ARM, 0);
     Blynk.virtualWrite(VPIN_STATE, "DISARMED");
@@ -783,6 +923,17 @@ BLYNK_WRITE(VPIN_TRIAL_H) {
 
 BLYNK_WRITE(VPIN_TRIAL_N) {
   if (param.asInt() == 1) startTrial(false, "neg");
+}
+
+BLYNK_WRITE(VPIN_WINDOW) {
+  uint32_t v = (uint32_t)param.asInt();
+  if (v < WINDOW_MIN_MS) v = WINDOW_MIN_MS;
+  if (v > WINDOW_MAX_MS) v = WINDOW_MAX_MS;
+  windowMs = v;
+  Serial.printf("[cfg] coincidence window = %lu ms\n", (unsigned long)windowMs);
+  char d[32];
+  snprintf(d, sizeof(d), "window=%lu", (unsigned long)windowMs);
+  csvEvent("cfg", d);
 }
 
 BLYNK_WRITE(VPIN_PERSIST) {
@@ -836,6 +987,7 @@ BLYNK_CONNECTED() {
   csvEvent("blynk_up");
   Blynk.syncVirtual(VPIN_THRESH);               // pull the slider values from the server
   Blynk.syncVirtual(VPIN_PERSIST);
+  Blynk.syncVirtual(VPIN_WINDOW);
   Blynk.virtualWrite(VPIN_ARM,   armed ? 1 : 0);  // device (NVS) is the source of truth for armed
   Blynk.virtualWrite(VPIN_STATE, stateString());
   Blynk.virtualWrite(VPIN_ALARM, alarmed ? 1 : 0);
@@ -866,6 +1018,7 @@ void diagHelp() {
   Serial.println(F("[cmd] ---- settings (type the value, then Enter) ------------"));
   Serial.println(F("[cmd]  T<cm>  trip threshold, e.g. T20      (5-200)"));
   Serial.println(F("[cmd]  N<n>   persistence cycles, e.g. N3   (2-8)"));
+  Serial.println(F("[cmd]  W<ms>  coincidence window, e.g. W1200 (300-4000)"));
   Serial.println(F("[cmd] ---- diagnostics --------------------------------------"));
   Serial.println(F("[cmd]  v ping-burst  t self-test  b buzzer  m pinmap"));
   Serial.println(F("[cmd]  p bring-up view   c CSV log   w WiFi/Blynk on-off"));
@@ -884,6 +1037,11 @@ void diagStatus() {
                 healthy[0], healthy[1], healthy[2], dist[0], dist[1], dist[2]);
   Serial.printf("  trip       %-12.1f persistence=%u cycles  streak=%u\n",
                 thresholdCm, (unsigned)persistN, (unsigned)openStreak);
+  Serial.printf("  window     %-12lu latches=%d%d%d   would-fire: persistence=%d window=%d\n",
+                (unsigned long)windowMs, liveLatch[0], liveLatch[1], liveLatch[2],
+                (int)altOldFired, (int)altWinFired);
+  Serial.printf("  risk       %-12u %s  (shadow — never triggers)\n",
+                (unsigned)riskScore, riskBand(riskScore));
   Serial.printf("  door       %-12s sound=%-7s events=%lu\n",
                 doorOpen ? "OPEN" : "closed", soundActive ? "ACTIVE" : "quiet",
                 (unsigned long)soundEventCount);
@@ -1014,12 +1172,23 @@ void runKey(char c) {
 void runValueCmd(const char *buf) {
   char key = buf[0];
   if (buf[1] == '\0') {                          // bare letter: report, don't change
-    if (key == 'T') Serial.printf("[cfg] trip threshold = %.1f cm (type e.g. T20)\n", thresholdCm);
-    else            Serial.printf("[cfg] persistence = %u cycles (type e.g. N3)\n", (unsigned)persistN);
+    if      (key == 'T') Serial.printf("[cfg] trip threshold = %.1f cm (type e.g. T20)\n", thresholdCm);
+    else if (key == 'N') Serial.printf("[cfg] persistence = %u cycles (type e.g. N3)\n", (unsigned)persistN);
+    else                 Serial.printf("[cfg] coincidence window = %lu ms (type e.g. W1200)\n",
+                                       (unsigned long)windowMs);
     return;
   }
   float v = atof(buf + 1);
-  if (key == 'T') {
+  if (key == 'W') {
+    uint32_t w = (uint32_t)v;
+    if (w < WINDOW_MIN_MS) w = WINDOW_MIN_MS;
+    if (w > WINDOW_MAX_MS) w = WINDOW_MAX_MS;
+    windowMs = w;
+    Serial.printf("[cfg] coincidence window = %lu ms\n", (unsigned long)windowMs);
+    char d[32];
+    snprintf(d, sizeof(d), "window=%lu", (unsigned long)windowMs);
+    csvEvent("cfg", d);
+  } else if (key == 'T') {
     if (v < THRESH_MIN_CM) v = THRESH_MIN_CM;
     if (v > THRESH_MAX_CM) v = THRESH_MAX_CM;
     thresholdCm = v;
@@ -1063,7 +1232,7 @@ void handleSerialControl() {
       }
       continue;
     }
-    if (c == 'T' || c == 'N') { buf[0] = c; len = 1; continue; }
+    if (c == 'T' || c == 'N' || c == 'W') { buf[0] = c; len = 1; continue; }
     if (c == '\r' || c == '\n') continue;
     runKey(c);
   }

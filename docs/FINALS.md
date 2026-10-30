@@ -100,6 +100,54 @@ correct outcome. Serial `X` clears the persisted state if a latch ever sticks.
 New datastreams: V11 persistence, V12 siren test, V13 silence, V14 free heap,
 V15 sensors OK. Event `sensor_fault` is now fired by the firmware.
 
+## Tier 3 — delivered (branch `develop/v4`)
+
+**Coincidence window (Req 2).** The persistence rule asks all three beams to
+read open *at the same time* for `persistN` consecutive cycles — ~600-700 ms of
+continuous agreement. The panel crosses the beams in sequence, so a fast sweep
+can break all three without ever satisfying it. The window asks a weaker,
+better-matched question: did each beam trip at *some* point within the last
+`windowMs`? Each sensor latches its own trigger with a time-to-live; the rule
+closes when all three latches are live together.
+
+The two are **OR-ed**, so midterm behaviour is a strict subset: detection cannot
+get worse, only the false-positive count can. Default window 1200 ms, tunable
+live via V17 or serial `W<ms>` with no reflash.
+
+**Both rules are evaluated every cycle, including after the latch**, and what
+each *would* have done is recorded in `tmask` bits 3 and 4. One run therefore
+yields the before/after comparison directly — no second session on the old
+firmware. This is the measurement design, and it is why `docs` no longer asks
+for a separate midterm baseline run.
+
+**Risk score (Req 7) — shadow mode.** A 0-100 fusion published on V16, logged in
+the `risk` column, and banded (<30 normal, 30-69 elevated, ≥70 critical). It
+does **not** gate the alarm; crossing into elevated raises a `pre_alarm`
+notification only. Weights sum to exactly 100 and are reproducible for the
+paper:
+
+| Term | Max |
+| --- | --- |
+| beams open now (3 × 10) | 30 |
+| beams latched inside the window (3 × 8) | 24 |
+| persistence progress | 20 |
+| depth past the trip threshold | 16 |
+| sound within the last 30 s | 10 |
+
+**Verified on the host, not just compiled.** The decision logic was lifted
+verbatim into a harness and run against synthetic beam traces: held panel (both
+rules fire), fast staggered sweep with and without overlap (window only),
+reversed sweep direction (window only), all-three-for-two-cycles (window only),
+one beam, two beams, beams tripped beyond the TTL, and nothing at all (neither
+rule fires in any negative case). A TTL sweep shows the window length trading
+recall against false alarms as expected.
+
+**What is not guaranteed.** Whether the window actually *gains* detections
+depends on an empirical fact about this rig — whether a fast sweep really does
+fail the persistence rule. If `detections gained` comes back 0, that is a real
+negative result and should be reported as one; the paper then leans on the
+Tier 2 reliability improvements, which are deterministic.
+
 ## Standalone operation
 
 The firmware is fully operable with no Blynk account and no network. Every

@@ -169,6 +169,12 @@ def build_trials(session, window_ms):
             # Sweep speed is the independent variable, so everything downstream
             # is reported per class as well as pooled.
             "cls": mk["detail"].strip() or ("pos" if expect else "neg"),
+            # tmask bits 3/4 record what each rule WOULD have done on its own,
+            # evaluated in parallel for the whole arm cycle. This is what makes
+            # the old-vs-new comparison come out of a single run.
+            "old_fired": 1 if any(int(s_["tmask"]) & 0x08 for s_ in win) else 0,
+            "win_fired": 1 if any(int(s_["tmask"]) & 0x10 for s_ in win) else 0,
+            "risk_max": max((s_["risk"] for s_ in win), default=""),
             "expected": "alarm" if expect else "no_alarm",
             "observed": "alarm" if hit else "no_alarm",
             "outcome": ("TP" if expect and hit else
@@ -314,6 +320,48 @@ def report(sessions, trials, out=sys.stdout):
                     fp = sum(1 for t in grp if t["outcome"] == "FP")
                     w(f"    {cl:<10} n={len(grp):<4} false alarms"
                       f" {fp}/{len(grp)}   {100.0 * fp / len(grp):5.1f}%\n")
+
+        # ---- the Tier 3 result: both rules, one run ----------------------
+        has_rules = any(t["old_fired"] or t["win_fired"] for t in trials)
+        if has_rules:
+            pos = [t for t in trials if t["expected"] == "alarm"]
+            neg = [t for t in trials if t["expected"] != "alarm"]
+            w("\n  rule comparison  (both evaluated in parallel, same run)\n")
+            if pos:
+                a = sum(t["old_fired"] for t in pos)
+                b = sum(1 for t in pos if t["old_fired"] or t["win_fired"])
+                w(f"    persistence alone      {a}/{len(pos)}"
+                  f"   {100.0 * a / len(pos):5.1f}%\n")
+                w(f"    + coincidence window   {b}/{len(pos)}"
+                  f"   {100.0 * b / len(pos):5.1f}%\n")
+                w(f"    detections gained      {b - a}\n")
+                if b == a:
+                    w("    -> no gap on this rig: the window caught nothing the\n"
+                      "       persistence rule missed. Report that honestly; it is a\n"
+                      "       real negative result, not a failed experiment.\n")
+            if neg:
+                fa = sum(t["old_fired"] for t in neg)
+                fb = sum(1 for t in neg if t["old_fired"] or t["win_fired"])
+                w(f"    false alarms           persistence {fa}/{len(neg)},"
+                  f" with window {fb}/{len(neg)}\n")
+                if fb > fa:
+                    w(f"    -> the window costs {fb - fa} extra false alarm(s).\n"
+                      f"       Shorten it (serial W<ms>) and re-run the negatives.\n")
+
+        # ---- risk score separation (Req 7 evidence) ----------------------
+        rp = [t["risk_max"] for t in trials if t["expected"] == "alarm"
+              and isinstance(t["risk_max"], (int, float))]
+        rn = [t["risk_max"] for t in trials if t["expected"] != "alarm"
+              and isinstance(t["risk_max"], (int, float))]
+        if rp and rn:
+            w("\n  risk score  (shadow — reported, never triggers)\n")
+            w(f"    openings     n={len(rp):<4} mean={stats.mean(rp):5.1f}"
+              f"  min={min(rp):5.1f}\n")
+            w(f"    disturbances n={len(rn):<4} mean={stats.mean(rn):5.1f}"
+              f"  max={max(rn):5.1f}\n")
+            gap = min(rp) - max(rn)
+            w(f"    separation   {gap:+.1f}"
+              f"  ({'clean — no overlap' if gap > 0 else 'OVERLAPPING'})\n")
 
         w("\n  latency\n")
         w(describe("detect (beam->siren)",
@@ -619,6 +667,40 @@ def figures(sessions, trials, out_dir):
                      color=INK, fontsize=10, loc="left", pad=10)
         ax.grid(axis="x", visible=False)
         save(fig, "dip_durations.png")
+
+    # ---- 4b. risk score by trial class -----------------------------------
+    rr = [t for t in trials if isinstance(t["risk_max"], (int, float))]
+    if rr and any(t["risk_max"] for t in rr):
+        fig, ax = plt.subplots(figsize=(6.0, 3.2))
+        cats = []
+        for t in rr:
+            if t["cls"] not in cats:
+                cats.append(t["cls"])
+        for ci, cl in enumerate(cats):
+            vals = [t["risk_max"] for t in rr if t["cls"] == cl]
+            colour = SERIES[ci % len(SERIES)]
+            jitter = [ci + (k % 7 - 3) * 0.035 for k in range(len(vals))]
+            ax.scatter(jitter, vals, s=34, color=colour, alpha=0.75,
+                       edgecolor=SURFACE, linewidth=1.2, zorder=3)
+            med = stats.median(vals)
+            ax.plot([ci - 0.22, ci + 0.22], [med, med], color=colour,
+                    linewidth=2.5, solid_capstyle="round", zorder=4)
+            ax.annotate(f"median {med:.0f}", (ci, med), xytext=(0, 7),
+                        textcoords="offset points", color=colour, fontsize=8,
+                        fontweight="bold", ha="center", va="bottom")
+        for y, lab, col in ((30, "ELEVATED", WARNING), (70, "CRITICAL", CRITICAL)):
+            ax.axhline(y, color=col, linewidth=1.2, linestyle=(0, (4, 3)), zorder=2)
+            ax.annotate(lab, (-0.45, y), xytext=(0, 4), textcoords="offset points",
+                        color=col, fontsize=8, fontweight="bold")
+        ax.set_xticks(range(len(cats)))
+        ax.set_xticklabels(cats)
+        ax.set_ylabel("peak risk score")
+        ax.set_xlim(-0.55, len(cats) - 0.45)
+        ax.set_ylim(0, 105)
+        ax.set_title("Risk score by trial class", color=INK, fontsize=10,
+                     loc="left", pad=10)
+        ax.grid(axis="x", visible=False)
+        save(fig, "risk_by_class.png")
 
     # ---- 5. free heap over the capture -----------------------------------
     heaps = [(s["ms"] / 60000.0, s["heap"]) for s in samples
