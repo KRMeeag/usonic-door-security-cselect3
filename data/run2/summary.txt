@@ -1,0 +1,107 @@
+Reading 1 file(s): device-monitor-261030-212816.log
+
+==============================================================================
+DOOR INTRUSION DETECTOR — CAPTURE ANALYSIS
+==============================================================================
+
+  sessions (boots)           1
+  samples                    1054
+  events                     140
+  total captured             6.3 min
+  sampling period            300 ms
+
+  event counts
+    alarm                  12
+    arm                    36
+    arm_abort              1
+    boot                   1
+    pre_alarm              16
+    trial_neg              14
+    trial_pos              22
+    verdict                36
+    warn                   1
+    wifi_down              1
+
+------------------------------------------------------------------------------
+DETECTION PERFORMANCE  (Req 6)
+------------------------------------------------------------------------------
+
+  trials                     36   (positive 22, negative 14)
+
+                        observed
+                   alarm    no alarm
+    expected alarm      10          12   <- TP / FN
+          no alarm       2          12   <- FP / TN
+
+    recall                   45.5%
+    precision                83.3%
+    specificity              85.7%
+    false_positive_rate      14.3%
+    accuracy                 61.1%
+    f1                       58.8%
+
+  by trial class
+    fast       n=11   detected 1/11     9.1%
+    held       n=11   detected 9/11    81.8%
+    neg        n=14   false alarms 2/14    14.3%
+
+  rule comparison  (both evaluated in parallel, same run)
+    persistence alone      2/22     9.1%
+    + coincidence window   10/22    45.5%
+    detections gained      8
+    false alarms           persistence 0/14, with window 2/14
+    -> the window costs 2 extra false alarm(s).
+       Shorten it (serial W<ms>) and re-run the negatives.
+
+  risk score  (shadow — reported, never triggers)
+    openings     n=22   mean= 31.3  min=  0.0
+    disturbances n=14   mean= 35.8  max= 58.0
+    separation   -58.0  (OVERLAPPING)
+
+  latency
+  detect (beam->siren)       n=12   mean=   845.2 ms  sd=  731.7 ms  min=  -10.0 ms  max= 2161.0 ms
+  marker->siren              n=12   mean=  2164.4 ms  sd= 1150.3 ms  min=  491.0 ms  max= 4077.0 ms
+
+------------------------------------------------------------------------------
+BEAM DIP DURATIONS  —  sizes the Tier 3 coincidence window
+------------------------------------------------------------------------------
+
+  fast — beam dip span       n=33   mean=    45.5 ms  sd=  109.2 ms  min=    0.0 ms  max=  300.0 ms
+    0/11 of these held all three beams the ~720 ms the midterm rule needs
+  held — beam dip span       n=33   mean=   908.1 ms  sd=  674.8 ms  min=    0.0 ms  max= 2700.0 ms
+    3/11 of these held all three beams the ~720 ms the midterm rule needs
+
+  11/66 beam dips lasted a single sample (<= 300 ms) — at or below the sampling
+  resolution, so those are a measurement floor and not a real
+  duration. A high count means the sweep is faster than the sensor
+  round can resolve. Tier 4 made the round non-blocking but kept
+  its 300 ms cadence on purpose, so PERSIST_N cycles means the
+  same milliseconds in every capture. Shortening CYCLE_MS is now a
+  one-constant change — but never mid-battery.
+
+------------------------------------------------------------------------------
+STABILITY
+------------------------------------------------------------------------------
+
+  sensor 1 closed-door       n=900  mean=   169.5 cm  sd=   42.9 cm  min=   20.9 cm  max=  431.0 cm
+  sensor 2 closed-door       n=900  mean=   219.7 cm  sd=   47.6 cm  min=   20.2 cm  max=  312.5 cm
+  sensor 3 closed-door       n=900  mean=   167.7 cm  sd=   50.3 cm  min=   20.3 cm  max=  431.0 cm
+
+  free heap                  n=1054 mean=275695.9 B  sd=   25.2 B  min=275480.0 B  max=275704.0 B
+  RSSI                       no data
+  temperature                n=1048 mean=    28.8 C  sd=    0.0 C  min=   28.8 C  max=   28.9 C
+  humidity                   n=1048 mean=    72.9 %  sd=    0.2 %  min=   72.0 %  max=   73.0 %
+
+  heap drift over capture    +8 B  (no leak detected)
+  samples with a sensor fault 0  (0.00%)
+
+  wrote data/run2/samples.csv  (1054 rows)
+  wrote data/run2/events.csv  (140 rows)
+  wrote data/run2/trials.csv  (36 rows)
+  wrote docs/figures/run2/door_opening_trace.png
+  wrote docs/figures/run2/detection_latency.png
+  wrote docs/figures/run2/confusion_matrix.png
+  wrote docs/figures/run2/dip_durations.png
+  wrote docs/figures/run2/risk_by_class.png
+  wrote docs/figures/run2/free_heap.png
+

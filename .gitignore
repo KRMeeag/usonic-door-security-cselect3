@@ -6,3 +6,11 @@
 
 # local credentials — never commit
 include/secrets.h
+
+# working handoff docs — local team coordination, not deliverables
+WRITING_HANDOFF.md
+HARDWARE_HANDOFF.md
+
+# captured test data lives here; keep the dir, ignore raw monitor dumps
+logs/
+data/raw/

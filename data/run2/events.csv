@@ -1,0 +1,141 @@
+session,ms,type,detail
+0,6489.0,boot,ARMED reset=poweron
+0,11479.0,wifi_down,
+0,74988.0,verdict,old=0 win=0 risk=0
+0,76585.0,arm,b=157/221/263 thr=20 sos=348.8
+0,76585.0,trial_pos,fast
+0,83002.0,verdict,old=0 win=0 risk=0
+0,84594.0,arm,b=156/292/147 thr=20 sos=348.8
+0,84594.0,trial_pos,fast
+0,89896.0,verdict,old=0 win=0 risk=0
+0,91472.0,arm,b=157/221/148 thr=20 sos=348.8
+0,91472.0,trial_pos,fast
+0,96976.0,verdict,old=0 win=0 risk=0
+0,98547.0,arm,b=159/227/148 thr=20 sos=348.8
+0,98547.0,trial_pos,fast
+0,103966.0,verdict,old=0 win=0 risk=0
+0,105548.0,arm,b=157/291/148 thr=20 sos=348.8
+0,105548.0,trial_pos,fast
+0,106812.0,alarm,by=window d=19/19/12 thr=20 risk=60
+0,110461.0,verdict,old=0 win=1 risk=0
+0,112044.0,arm,b=157/291/148 thr=20 sos=348.8
+0,112044.0,trial_pos,fast
+0,117326.0,verdict,old=0 win=0 risk=0
+0,118929.0,arm,b=158/227/263 thr=20 sos=348.8
+0,118929.0,trial_pos,fast
+0,123994.0,verdict,old=0 win=0 risk=0
+0,125565.0,arm,b=159/227/148 thr=20 sos=348.8
+0,125565.0,trial_pos,fast
+0,128969.0,verdict,old=0 win=0 risk=0
+0,130540.0,arm,b=157/226/148 thr=20 sos=348.8
+0,130540.0,trial_pos,fast
+0,135229.0,verdict,old=0 win=0 risk=0
+0,136800.0,arm,b=157/224/150 thr=20 sos=348.8
+0,136800.0,trial_pos,fast
+0,141691.0,verdict,old=0 win=0 risk=0
+0,143270.0,arm,b=158/221/151 thr=20 sos=348.8
+0,143270.0,trial_pos,fast
+0,160078.0,verdict,old=0 win=0 risk=0
+0,161619.0,arm,b=86/221/55 thr=20 sos=348.8
+0,161619.0,trial_pos,held
+0,163209.0,pre_alarm,risk=38
+0,163512.0,alarm,by=window d=19/19/17 thr=20 risk=56
+0,167037.0,verdict,old=0 win=1 risk=0
+0,168636.0,arm,b=158/293/220 thr=20 sos=348.8
+0,168636.0,trial_pos,held
+0,170732.0,pre_alarm,risk=39
+0,171038.0,alarm,by=window d=18/227/262 thr=20 risk=35
+0,174085.0,verdict,old=0 win=1 risk=0
+0,175666.0,arm,b=158/227/149 thr=20 sos=348.8
+0,175666.0,trial_pos,held
+0,181277.0,verdict,old=0 win=0 risk=0
+0,182854.0,arm,b=158/226/150 thr=20 sos=348.8
+0,182854.0,trial_pos,held
+0,189351.0,verdict,old=0 win=0 risk=0
+0,190917.0,arm,b=157/226/88 thr=20 sos=348.8
+0,190917.0,trial_pos,held
+0,192312.0,alarm,by=window d=18/18/16 thr=20 risk=56
+0,194747.0,verdict,old=0 win=1 risk=0
+0,196213.0,arm,b=67/58/36 thr=20 sos=348.8
+0,196213.0,trial_pos,held
+0,198920.0,alarm,by=window d=20/16/149 thr=20 risk=47
+0,200151.0,verdict,old=0 win=1 risk=0
+0,201725.0,arm,b=158/227/147 thr=20 sos=348.8
+0,201725.0,trial_pos,held
+0,202036.0,pre_alarm,risk=38
+0,202216.0,alarm,by=window d=18/18/16 thr=20 risk=56
+0,204877.0,verdict,old=1 win=1 risk=0
+0,206452.0,arm,b=157/226/147 thr=20 sos=348.8
+0,206452.0,trial_pos,held
+0,207612.0,alarm,by=window d=18/19/17 thr=20 risk=56
+0,210388.0,verdict,old=1 win=1 risk=0
+0,211966.0,arm,b=158/222/150 thr=20 sos=348.8
+0,211966.0,trial_pos,held
+0,214209.0,pre_alarm,risk=37
+0,216012.0,alarm,by=window d=19/19/16 thr=20 risk=57
+0,218109.0,verdict,old=0 win=1 risk=0
+0,219684.0,arm,b=157/222/148 thr=20 sos=348.8
+0,219684.0,trial_pos,held
+0,221109.0,pre_alarm,risk=39
+0,221412.0,alarm,by=window d=16/17/16 thr=20 risk=57
+0,224558.0,verdict,old=0 win=1 risk=0
+0,226148.0,arm,b=157/226/262 thr=20 sos=348.8
+0,226148.0,trial_pos,held
+0,227712.0,alarm,by=window d=18/20/17 thr=20 risk=56
+0,232769.0,verdict,old=0 win=1 risk=0
+0,234344.0,arm,b=157/227/148 thr=20 sos=348.8
+0,234344.0,trial_neg,neg
+0,240923.0,pre_alarm,risk=31
+0,247187.0,verdict,old=0 win=0 risk=0
+0,248768.0,arm,b=209/221/148 thr=20 sos=348.8
+0,248768.0,trial_neg,neg
+0,250527.0,pre_alarm,risk=31
+0,255737.0,verdict,old=0 win=0 risk=0
+0,257324.0,arm,b=209/221/147 thr=20 sos=348.8
+0,257324.0,trial_neg,neg
+0,259227.0,pre_alarm,risk=31
+0,264358.0,verdict,old=0 win=0 risk=0
+0,265951.0,arm,b=208/226/149 thr=20 sos=348.8
+0,265951.0,trial_neg,neg
+0,269715.0,pre_alarm,risk=48
+0,272748.0,verdict,old=0 win=0 risk=49
+0,274019.0,arm_abort,health-or-sanity-check-failed
+0,279364.0,arm,b=154/222/148 thr=20 sos=348.8
+0,279364.0,trial_neg,neg
+0,281115.0,pre_alarm,risk=47
+0,284151.0,verdict,old=0 win=0 risk=0
+0,285740.0,arm,b=209/221/147 thr=20 sos=348.8
+0,285740.0,trial_neg,neg
+0,287119.0,pre_alarm,risk=47
+0,290640.0,verdict,old=0 win=0 risk=16
+0,292222.0,arm,b=209/221/148 thr=20 sos=348.8
+0,292222.0,trial_neg,neg
+0,294018.0,pre_alarm,risk=48
+0,301346.0,verdict,old=0 win=0 risk=0
+0,302917.0,arm,b=153/221/148 thr=20 sos=348.8
+0,302917.0,trial_neg,neg
+0,304822.0,pre_alarm,risk=42
+0,306994.0,alarm,by=window d=15/17/17 thr=20 risk=58
+0,308863.0,verdict,old=0 win=1 risk=0
+0,310448.0,arm,b=209/221/155 thr=20 sos=348.8
+0,310448.0,trial_neg,neg
+0,317420.0,pre_alarm,risk=37
+0,320979.0,verdict,old=0 win=0 risk=0
+0,322575.0,arm,b=210/224/155 thr=20 sos=348.8
+0,322575.0,trial_neg,neg
+0,324319.0,pre_alarm,risk=41
+0,325821.0,alarm,by=window d=9/14/177 thr=20 risk=53
+0,328305.0,verdict,old=0 win=1 risk=0
+0,329894.0,arm,b=209/225/178 thr=20 sos=348.8
+0,329894.0,trial_neg,neg
+0,331817.0,pre_alarm,risk=33
+0,336214.0,verdict,old=0 win=0 risk=0
+0,337807.0,arm,b=209/223/177 thr=20 sos=348.8
+0,337807.0,trial_neg,neg
+0,341143.0,warn,sound-no-door
+0,345308.0,verdict,old=0 win=0 risk=10
+0,346898.0,arm,b=209/214/177 thr=20 sos=348.8
+0,346898.0,trial_neg,neg
+0,352172.0,verdict,old=0 win=0 risk=10
+0,353767.0,arm,b=210/214/179 thr=20 sos=348.8
+0,353767.0,trial_neg,neg
