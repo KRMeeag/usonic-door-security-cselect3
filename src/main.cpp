@@ -39,6 +39,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <esp_system.h>   // esp_reset_reason()
 #include <BlynkSimpleEsp32.h>
 #include <DHT.h>
 
@@ -58,6 +59,11 @@
 #define VPIN_TRIAL_F V8  // button    — trial: panel swept through FAST  (Req 6)
 #define VPIN_TRIAL_H V9  // button    — trial: panel HELD in the beams    (Req 6)
 #define VPIN_TRIAL_N V10 // button    — trial: disturbance, must NOT alarm (Req 6)
+#define VPIN_PERSIST V11 // slider 2-8 — consecutive all-open cycles before alarm
+#define VPIN_TEST    V12 // button    — siren self-test (ignored during a real alarm)
+#define VPIN_SILENCE V13 // button    — silence the siren WITHOUT clearing the latch
+#define VPIN_HEAP    V14 // int       — free heap, bytes (soak / leak evidence)
+#define VPIN_HEALTH  V15 // int 0/1   — 1 = all three sensors healthy
 
 // (GPIO map lives in include/pins.h)
 
@@ -94,6 +100,15 @@ static const uint16_t SIREN_HI_HZ      = 1200;
 
 static const uint32_t WARN_COOLDOWN_MS = 60000;  // door_noise_warning rate limit
 static const uint16_t SOUND_LED_HOLD_MS = 250;   // stretch momentary DO pulses so LED4 is visible
+
+// --- Tier 2 safeguards ---------------------------------------------------
+static const uint8_t  FAULT_CONFIRM_N  = 5;      // consecutive bad cycles before calling it a fault
+static const uint32_t DHT_STALE_MS     = 30000;  // past this with no good read, readings are invalid
+static const uint32_t SIREN_ON_MS      = 10000;  // siren duty cycle: on...
+static const uint32_t SIREN_OFF_MS     = 2000;   // ...then a gap. Cuts average current and ear fatigue.
+static const uint8_t  EVENT_MAX_PER_HR = 20;     // hard cap on Blynk notifications; the server
+                                                 // rate-limits and SILENTLY DROPS the excess
+static const uint8_t  EVQ_N            = 12;     // offline notification ring depth
 
 static const uint16_t BLINK_FAST_MS    = 100;    // LED1-3 door-open, LED5 alarm
 static const uint16_t BLINK_SLOW_MS    = 400;    // LED5 armed
@@ -132,7 +147,22 @@ float thresholdCm   = THRESH_DEFAULT_CM;  // absolute trip distance, V5
 // (one hwcheck-style status line, LED1-3 = raw echo health). Toggle with 'p'.
 bool  diagMode = false;
 
-bool     pendingIntrusionEvent = false;  // logEvent failed while offline -> retry on connect
+// Offline notification ring. The midterm carried a single bool, so two
+// offline alarms collapsed into one notification and warnings were never
+// queued at all. `code` always points at a string literal.
+struct QEvent { uint32_t ms; const char *code; };
+QEvent   evq[EVQ_N];
+uint8_t  evqHead = 0, evqCount = 0, evqDropped = 0;
+
+uint32_t eventWindowStart = 0;         // rolling hour for the notification budget
+uint8_t  eventsThisWindow = 0;
+
+uint8_t  faultStreak = 0;              // consecutive cycles with a sensor down
+bool     faultActive = false;          // debounced "a sensor is dead" state
+uint32_t lastDhtOkMs = 0;
+bool     dhtStale    = false;
+bool     sirenMuted  = false;          // silenced by the user; latch stays set
+uint8_t  persistN    = PERSIST_N;      // V11 — runtime-tunable
 uint32_t lastWarnMs = 0;
 
 // --------------------------------------------------------------------------
@@ -322,7 +352,12 @@ void sirenOff() {
 // the 3-minute window; silent otherwise. The alarm stays latched after the
 // siren times out.
 void serviceSiren(uint32_t now) {
-  bool want = alarmed && (now - sirenStart < SIREN_MAX_MS);
+  uint32_t el   = now - sirenStart;
+  bool     want = alarmed && !sirenMuted && (el < SIREN_MAX_MS);
+  if (want) {                                   // duty-cycle: SIREN_ON_MS on, then a gap
+    uint32_t phase = el % (SIREN_ON_MS + SIREN_OFF_MS);
+    if (phase >= SIREN_ON_MS) want = false;
+  }
   if (!want) {
     if (currentToneHz != 0) sirenOff();
     return;
@@ -348,15 +383,73 @@ void disarmChirp() {                             // short falling two-tone
 
 // --------------------------------------------------------------------------
 // Notifications
+//
+// Every outbound Blynk event goes through notify(): budget-checked, and
+// queued rather than dropped when offline. Blynk rate-limits events
+// server-side and discards the overflow without telling anyone, so an
+// unbounded burst does not mean "lots of alerts", it means "no alerts".
 // --------------------------------------------------------------------------
-void raiseIntrusionEvent() {
-  if (Blynk.connected()) {
-    Blynk.logEvent("intrusion_alarm");
-    pendingIntrusionEvent = false;
-  } else {
-    pendingIntrusionEvent = true;               // resume on reconnect
+const char *resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    default:                return "unknown";
   }
 }
+
+bool eventBudgetOk() {
+  uint32_t now = millis();
+  if (now - eventWindowStart > 3600000UL) {     // roll the hour
+    eventWindowStart = now;
+    eventsThisWindow = 0;
+  }
+  if (eventsThisWindow >= EVENT_MAX_PER_HR) return false;
+  eventsThisWindow++;
+  return true;
+}
+
+void queueEvent(const char *code) {
+  if (evqCount == EVQ_N) {                      // full: drop the oldest, count it
+    evqHead = (evqHead + 1) % EVQ_N;
+    evqCount--;
+    if (evqDropped < 255) evqDropped++;
+  }
+  evq[(evqHead + evqCount) % EVQ_N] = { millis(), code };
+  evqCount++;
+}
+
+// Send one notification, or queue it if that is not possible right now.
+void notify(const char *code) {
+  if (!Blynk.connected()) { queueEvent(code); return; }
+  if (!eventBudgetOk()) {
+    csvEvent("event_dropped", code);            // budget exhausted — visible in the log
+    return;
+  }
+  Blynk.logEvent(code);
+}
+
+// Drain at most one queued event per call, so a backlog never blocks the loop.
+void flushEventQueue() {
+  if (!evqCount || !Blynk.connected()) return;
+  if (!eventBudgetOk()) return;
+  const char *code = evq[evqHead].code;
+  uint32_t    age  = millis() - evq[evqHead].ms;
+  evqHead = (evqHead + 1) % EVQ_N;
+  evqCount--;
+  Blynk.logEvent(code);
+  char d[48];
+  snprintf(d, sizeof(d), "%s age=%lums", code, (unsigned long)age);
+  csvEvent("queued_sent", d);
+}
+
+void raiseIntrusionEvent() { notify("intrusion_alarm"); }
 
 void maybeWarn() {
   uint32_t now = millis();
@@ -364,14 +457,27 @@ void maybeWarn() {
   lastWarnMs = now;
   Serial.println("[warn] door_noise_warning");
   csvEvent("warn", "sound-no-door");
-  if (Blynk.connected()) Blynk.logEvent("door_noise_warning");
+  notify("door_noise_warning");
 }
 
 // --------------------------------------------------------------------------
-// Persistence (armed flag only — Blynk re-syncs the slider server-side)
+// Persistence
+//
+// The midterm persisted `armed` but hardcoded `alarmed = false` at boot, so
+// cutting the power silenced a latched siren — a power-cycle bypass, and the
+// opposite of what §8.5 argues for. Both flags are persisted now.
+//
+// The siren's 3-minute budget deliberately restarts on boot rather than being
+// persisted: it avoids writing to NVS on a timer, and someone power-cycling
+// the device to shut it up getting a fresh siren each time is the correct
+// outcome. Serial 'X' clears the stored state if a latch ever gets stuck.
 // --------------------------------------------------------------------------
 void persistArmed(bool v) {
   prefs.putBool("armed", v);
+}
+
+void persistAlarmed(bool v) {
+  prefs.putBool("alarmed", v);
 }
 
 // --------------------------------------------------------------------------
@@ -396,15 +502,40 @@ void sensorCycle() {
   }
 
   bool allHealthy = healthy[0] && healthy[1] && healthy[2];
+
+  // Debounced sensor-fault detection. The midterm forced an unhealthy sensor
+  // to "not open" and required all three to agree, so one unplugged ECHO made
+  // the alarm permanently unable to fire while the dashboard still read ARMED.
+  // That is fail-silent. It still cannot fire — but now it says so.
+  if (allHealthy) faultStreak = 0;
+  else if (faultStreak < 255) faultStreak++;
+
+  bool nowFault = (faultStreak >= FAULT_CONFIRM_N);
+  if (nowFault != faultActive) {
+    faultActive = nowFault;
+    char d[32];
+    snprintf(d, sizeof(d), "h=%d%d%d", healthy[0], healthy[1], healthy[2]);
+    if (faultActive) {
+      Serial.printf("[FAULT] sensor down (%s) — detection is degraded\n", d);
+      csvEvent("fault", d);
+      notify("sensor_fault");
+    } else {
+      Serial.println("[FAULT] cleared — all three sensors healthy");
+      csvEvent("fault_cleared", d);
+    }
+  }
+
   bool allOpen    = allHealthy && openFlag[0] && openFlag[1] && openFlag[2];
   bool noneOpen   = !openFlag[0] && !openFlag[1] && !openFlag[2];
   doorOpen = allOpen;
 
   if (armed && !alarmed) {
     openStreak = allOpen ? (openStreak + 1) : 0;
-    if (openStreak >= PERSIST_N) {
+    if (openStreak >= persistN) {
       alarmed    = true;                        // LATCHED
       sirenStart = millis();
+      sirenMuted = false;                       // a new alarm overrides a previous silence
+      persistAlarmed(true);                     // survives a power cut
       Serial.println("[ALARM] intrusion — all 3 sensors past threshold, sustained");
       {
         char d[48];
@@ -500,8 +631,21 @@ void readEnvironment() {
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   dhtOk = !isnan(t) && !isnan(h);
-  if (!isnan(t)) lastTempC    = t;
-  if (!isnan(h)) lastHumidity = h;
+  if (dhtOk) {
+    lastTempC    = t;
+    lastHumidity = h;
+    lastDhtOkMs  = millis();
+    if (dhtStale) { dhtStale = false; csvEvent("dht_ok"); }
+  } else if (!dhtStale && millis() - lastDhtOkMs > DHT_STALE_MS) {
+    // The midterm kept publishing the last good value forever after the sensor
+    // died. Past the staleness window the readings are invalidated instead, so
+    // nothing downstream trusts a number that is no longer being measured.
+    dhtStale     = true;
+    lastTempC    = NAN;
+    lastHumidity = NAN;
+    csvEvent("dht_stale");
+    Serial.println("[env] DHT stale — readings invalidated");
+  }
   if (!diagMode)                                  // diag view carries t/h on its status line
     Serial.printf("[env] t=%.1f C  h=%.0f %%%s\n", lastTempC, lastHumidity,
                   dhtOk ? "" : "   (DHT read failed)");
@@ -519,6 +663,9 @@ void publishStatus() {
   Blynk.virtualWrite(VPIN_SOUND, soundSincePublish ? 1 : 0);
   soundSincePublish = false;
   Blynk.virtualWrite(VPIN_ALARM, alarmed ? 1 : 0);
+  Blynk.virtualWrite(VPIN_HEAP,   (uint32_t)ESP.getFreeHeap());
+  Blynk.virtualWrite(VPIN_HEALTH, faultActive ? 0 : 1);
+  flushEventQueue();                            // at most one per tick
 }
 
 // --------------------------------------------------------------------------
@@ -589,8 +736,10 @@ void disarm(const char *src) {
   armed      = false;
   alarmed    = false;
   openStreak = 0;
+  sirenMuted = false;
   sirenOff();
   persistArmed(false);
+  persistAlarmed(false);
   if (wasActive) {
     Serial.printf("[disarm] by %s\n", src);
     csvEvent("disarm", src);
@@ -622,6 +771,39 @@ BLYNK_WRITE(VPIN_TRIAL_N) {
   if (param.asInt() == 1) startTrial(false, "neg");
 }
 
+BLYNK_WRITE(VPIN_PERSIST) {
+  int v = param.asInt();
+  if (v < 2) v = 2;
+  if (v > 8) v = 8;
+  persistN = (uint8_t)v;
+  Serial.printf("[cfg] persistence = %u cycles\n", persistN);
+  char d[24];
+  snprintf(d, sizeof(d), "persistN=%u", persistN);
+  csvEvent("cfg", d);
+}
+
+BLYNK_WRITE(VPIN_TEST) {
+  if (param.asInt() != 1) return;
+  if (alarmed) {                                // never talk over a real alarm
+    Serial.println("[test] ignored — alarm is active");
+    return;
+  }
+  Serial.println("[test] siren test");
+  csvEvent("siren_test");
+  for (int f = 800; f <= 1600; f += 200) { tone(PIEZO_PIN, f, 120); delay(140); }
+  noTone(PIEZO_PIN);
+  currentToneHz = 0;
+}
+
+BLYNK_WRITE(VPIN_SILENCE) {
+  if (param.asInt() != 1) return;
+  if (!alarmed) return;
+  sirenMuted = true;                            // LATCH STAYS SET — this is not a disarm
+  sirenOff();
+  Serial.println("[silence] siren muted; alarm still latched");
+  csvEvent("siren_muted");
+}
+
 BLYNK_WRITE(VPIN_THRESH) {
   float v = param.asFloat();
   if (v < THRESH_MIN_CM) v = THRESH_MIN_CM;
@@ -638,13 +820,16 @@ BLYNK_WRITE(VPIN_THRESH) {
 BLYNK_CONNECTED() {
   Serial.println("[blynk] connected");
   csvEvent("blynk_up");
-  Blynk.syncVirtual(VPIN_THRESH);               // pull the slider value from the server
+  Blynk.syncVirtual(VPIN_THRESH);               // pull the slider values from the server
+  Blynk.syncVirtual(VPIN_PERSIST);
   Blynk.virtualWrite(VPIN_ARM,   armed ? 1 : 0);  // device (NVS) is the source of truth for armed
   Blynk.virtualWrite(VPIN_STATE, stateString());
   Blynk.virtualWrite(VPIN_ALARM, alarmed ? 1 : 0);
-  if (pendingIntrusionEvent) {
-    Blynk.logEvent("intrusion_alarm");
-    pendingIntrusionEvent = false;
+  if (evqCount) {
+    char d[32];
+    snprintf(d, sizeof(d), "queued=%u dropped=%u", evqCount, evqDropped);
+    Serial.printf("[blynk] flushing offline events (%s)\n", d);
+    csvEvent("queue_flush", d);                 // publishStatus drains it, one per second
   }
 }
 
@@ -663,6 +848,7 @@ void diagHelp() {
   Serial.println(F("[cmd] a arm  d disarm  ? state  h help"));
   Serial.println(F("[cmd] c toggle CSV log | trials: 1 FAST sweep  2 HELD  0 disturbance"));
   Serial.println(F("[cmd] (trials are also Blynk buttons V8/V9/V10 — one tap each)"));
+  Serial.println(F("[cmd] X clear persisted armed/alarm state (stuck-latch escape hatch)"));
 }
 
 void diagPinMap() {
@@ -726,6 +912,15 @@ void handleSerialControl() {
       case 't': diagSelfTest();  break;
       case 'b': diagBuzzer();    break;
       case 'm': diagPinMap();    break;
+      case 'X':                                  // escape hatch for a stuck latch
+        prefs.putBool("armed", false);
+        prefs.putBool("alarmed", false);
+        armed = alarmed = false;
+        sirenMuted = false;
+        sirenOff();
+        Serial.println("[serial] persisted state CLEARED — disarmed");
+        csvEvent("nvs_cleared");
+        break;
       case 'h': diagHelp();      break;
 
       // Req 6 test battery. Same full cycle as the V8/V9 buttons — re-arm,
@@ -835,8 +1030,13 @@ void setup() {
 
   prefs.begin("door", false);
   armed      = prefs.getBool("armed", false);
-  alarmed    = false;
+  alarmed    = prefs.getBool("alarmed", false);   // a latched alarm survives power loss
   openStreak = 0;
+  if (alarmed) {
+    armed      = true;                            // an alarm implies the system was armed
+    sirenStart = millis();                        // fresh siren budget; see persistAlarmed()
+    Serial.println("[boot] ALARM latch restored from NVS — siren resuming");
+  }
 
   dht.begin();
 
@@ -859,7 +1059,11 @@ void setup() {
   timer.setInterval(NETCHECK_MS, netWatchdog);
 
   Serial.printf("[boot] ready — state %s\n", stateString());
-  csvEvent("boot", stateString());
+  {
+    char d[48];
+    snprintf(d, sizeof(d), "%s reset=%s", stateString(), resetReasonStr());
+    csvEvent("boot", d);                          // reset reason turns crashes into data
+  }
   diagHelp();
 }
 

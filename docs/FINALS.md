@@ -76,6 +76,30 @@ are compared against.
 - **`tools/make_selftest_log.py`** — synthetic capture so the analysis can be
   verified with no hardware. A correct run reports 7 TP / 3 FN / 0 FP / 8 TN.
 
+## Tier 2 — delivered
+
+Eight safeguards, all desk-verifiable. Two close genuine security holes found by
+auditing the midterm firmware.
+
+| # | Safeguard | What it fixes |
+| --- | --- | --- |
+| 1 | Alarm latch persisted to NVS | The midterm restored `armed` but hardcoded `alarmed = false`, so cutting power silenced a latched siren — a power-cycle bypass of §8.5's own argument |
+| 2 | Debounced `sensor_fault` notification + `Sensors OK` on V15 | A dead sensor made the alarm permanently unable to fire while the dashboard still read `ARMED`. Fail-silent becomes fail-safe |
+| 3 | 12-deep offline event ring, drained one per second | The one-bit queue collapsed two offline alarms into one notification and never queued warnings |
+| 4 | Notification budget, 20/hour, refusals logged | Blynk rate-limits events server-side and silently drops the overflow |
+| 5 | DHT staleness window (30 s) | Stale readings were published forever after the sensor died |
+| 6 | `esp_reset_reason()` logged at boot | Crashes and brownouts become data |
+| 7 | Siren duty cycle, 10 s on / 2 s off | Lower average current, far less unpleasant, still inside the 3-minute cap |
+| 8 | Siren test, silence-without-disarm, runtime persistence slider | Manual control, and the silence button is what a real user actually wants |
+
+The siren's three-minute budget **restarts on boot** rather than being
+persisted. That avoids writing to flash on a timer, and an intruder
+power-cycling the device to silence it getting a fresh siren each time is the
+correct outcome. Serial `X` clears the persisted state if a latch ever sticks.
+
+New datastreams: V11 persistence, V12 siren test, V13 silence, V14 free heap,
+V15 sensors OK. Event `sensor_fault` is now fired by the firmware.
+
 ## Capturing a run
 
 ```sh
