@@ -162,7 +162,8 @@ bool     faultActive = false;          // debounced "a sensor is dead" state
 uint32_t lastDhtOkMs = 0;
 bool     dhtStale    = false;
 bool     sirenMuted  = false;          // silenced by the user; latch stays set
-uint8_t  persistN    = PERSIST_N;      // V11 — runtime-tunable
+uint8_t  persistN    = PERSIST_N;      // V11 / serial 'N' — runtime-tunable
+bool     netEnabled  = true;           // serial 'w' — off = fully standalone, no WiFi/Blynk
 uint32_t lastWarnMs = 0;
 
 // --------------------------------------------------------------------------
@@ -426,18 +427,26 @@ void queueEvent(const char *code) {
 }
 
 // Send one notification, or queue it if that is not possible right now.
+// Every notification is announced on serial as well as sent, so the whole
+// alert path can be verified on the terminal with no phone and no Blynk.
 void notify(const char *code) {
-  if (!Blynk.connected()) { queueEvent(code); return; }
-  if (!eventBudgetOk()) {
-    csvEvent("event_dropped", code);            // budget exhausted — visible in the log
+  if (!netEnabled || !Blynk.connected()) {
+    queueEvent(code);
+    Serial.printf("[notify] %s  (offline — queued, %u waiting)\n", code, evqCount);
     return;
   }
+  if (!eventBudgetOk()) {
+    Serial.printf("[notify] %s  DROPPED — hourly budget spent\n", code);
+    csvEvent("event_dropped", code);
+    return;
+  }
+  Serial.printf("[notify] %s  -> Blynk\n", code);
   Blynk.logEvent(code);
 }
 
 // Drain at most one queued event per call, so a backlog never blocks the loop.
 void flushEventQueue() {
-  if (!evqCount || !Blynk.connected()) return;
+  if (!evqCount || !netEnabled || !Blynk.connected()) return;
   if (!eventBudgetOk()) return;
   const char *code = evq[evqHead].code;
   uint32_t    age  = millis() - evq[evqHead].ms;
@@ -655,7 +664,7 @@ void readEnvironment() {
 // Telemetry push  (every PUBLISH_MS)
 // --------------------------------------------------------------------------
 void publishStatus() {
-  if (!Blynk.connected()) return;
+  if (!netEnabled || !Blynk.connected()) return;
   if (!isnan(lastTempC))    Blynk.virtualWrite(VPIN_TEMP, lastTempC);
   if (!isnan(lastHumidity)) Blynk.virtualWrite(VPIN_HUM,  lastHumidity);
   Blynk.virtualWrite(VPIN_DOOR,  doorOpen ? 1 : 0);
@@ -672,6 +681,7 @@ void publishStatus() {
 // WiFi reconnect watchdog  (every NETCHECK_MS)
 // --------------------------------------------------------------------------
 void netWatchdog() {
+  if (!netEnabled) return;                        // standalone mode — serial 'w'
   static bool wasDown = false;
   if (WiFi.status() == WL_CONNECTED) {
     if (wasDown) {                                // log the recovery edge too
@@ -689,7 +699,11 @@ void netWatchdog() {
   uint32_t now = millis();
   if (now - lastKick < 15000) return;
   lastKick = now;
-  Serial.println("[net] WiFi down — reconnecting");
+  static uint8_t tries = 0;                       // don't shout every 15 s forever
+  if (tries % 4 == 0)
+    Serial.printf("[net] WiFi down — reconnecting (attempt %u; 'w' for standalone)\n",
+                  (unsigned)(tries + 1));
+  tries++;
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 }
@@ -844,11 +858,47 @@ BLYNK_CONNECTED() {
 static const bool ALLOW_SERIAL_CONTROL = true;
 
 void diagHelp() {
-  Serial.println(F("[cmd] p toggle bring-up view | v ping-burst  t self-test  b buzzer  m pinmap"));
-  Serial.println(F("[cmd] a arm  d disarm  ? state  h help"));
-  Serial.println(F("[cmd] c toggle CSV log | trials: 1 FAST sweep  2 HELD  0 disturbance"));
-  Serial.println(F("[cmd] (trials are also Blynk buttons V8/V9/V10 — one tap each)"));
-  Serial.println(F("[cmd] X clear persisted armed/alarm state (stuck-latch escape hatch)"));
+  Serial.println(F("[cmd] ---- control -------------------------------------------"));
+  Serial.println(F("[cmd]  a arm      d disarm     s silence siren (latch stays)"));
+  Serial.println(F("[cmd]  ? status   h help       X clear persisted armed/alarm"));
+  Serial.println(F("[cmd] ---- trials (Req 6) -----------------------------------"));
+  Serial.println(F("[cmd]  1 FAST sweep   2 HELD panel   0 disturbance"));
+  Serial.println(F("[cmd] ---- settings (type the value, then Enter) ------------"));
+  Serial.println(F("[cmd]  T<cm>  trip threshold, e.g. T20      (5-200)"));
+  Serial.println(F("[cmd]  N<n>   persistence cycles, e.g. N3   (2-8)"));
+  Serial.println(F("[cmd] ---- diagnostics --------------------------------------"));
+  Serial.println(F("[cmd]  v ping-burst  t self-test  b buzzer  m pinmap"));
+  Serial.println(F("[cmd]  p bring-up view   c CSV log   w WiFi/Blynk on-off"));
+  Serial.println(F("[cmd] Everything here works with no Blynk and no network."));
+}
+
+// One-screen readout of everything the Blynk dashboard would show. This is
+// what makes the device fully testable with no app and no network.
+void diagStatus() {
+  uint32_t up = millis() / 1000;
+  Serial.println(F("[status] -------------------------------------------------"));
+  Serial.printf("  state      %-12s armed=%d alarm=%d muted=%d\n",
+                stateString(), (int)armed, (int)alarmed, (int)sirenMuted);
+  Serial.printf("  sensors    %-12s h=%d%d%d  d=%.0f/%.0f/%.0f cm\n",
+                faultActive ? "FAULT" : "OK",
+                healthy[0], healthy[1], healthy[2], dist[0], dist[1], dist[2]);
+  Serial.printf("  trip       %-12.1f persistence=%u cycles  streak=%u\n",
+                thresholdCm, (unsigned)persistN, (unsigned)openStreak);
+  Serial.printf("  door       %-12s sound=%-7s events=%lu\n",
+                doorOpen ? "OPEN" : "closed", soundActive ? "ACTIVE" : "quiet",
+                (unsigned long)soundEventCount);
+  if (dhtStale) Serial.println(F("  env        STALE        DHT not reporting"));
+  else          Serial.printf("  env        %.1f C / %.0f %%\n", lastTempC, lastHumidity);
+  Serial.printf("  net        wifi=%-9s blynk=%-7s queued=%u dropped=%u\n",
+                netEnabled ? (WiFi.status() == WL_CONNECTED ? "up" : "down") : "OFF",
+                (netEnabled && Blynk.connected()) ? "up" : "down",
+                (unsigned)evqCount, (unsigned)evqDropped);
+  Serial.printf("  heap       %-12lu uptime=%02lu:%02lu:%02lu\n",
+                (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)(up / 3600), (unsigned long)((up / 60) % 60),
+                (unsigned long)(up % 60));
+  Serial.printf("  csv        %-12s schema=%d\n", csvMode ? "ON" : "OFF", LOG_SCHEMA);
+  Serial.println(F("[status] -------------------------------------------------"));
 }
 
 void diagPinMap() {
@@ -891,54 +941,131 @@ void diagPingBurst() {
   }
 }
 
+// Instant single-key commands. Everything the Blynk dashboard can do is
+// reachable here, so the device is fully testable standalone.
+void runKey(char c) {
+  switch (c) {
+    case 'a':
+      if (ALLOW_SERIAL_CONTROL) { Serial.println("[serial] arm request"); doArm(); }
+      else Serial.println("[serial] a/d disabled (ALLOW_SERIAL_CONTROL=false)");
+      break;
+    case 'd':
+      if (ALLOW_SERIAL_CONTROL) { Serial.println("[serial] disarm request"); disarm("serial"); }
+      else Serial.println("[serial] a/d disabled (ALLOW_SERIAL_CONTROL=false)");
+      break;
+    case 's':                                    // serial twin of the V13 button
+      if (!alarmed) { Serial.println("[serial] no alarm to silence"); break; }
+      sirenMuted = true;                         // LATCH STAYS SET — not a disarm
+      sirenOff();
+      Serial.println("[silence] siren muted; alarm still latched");
+      csvEvent("siren_muted");
+      break;
+    case 'w':
+      netEnabled = !netEnabled;
+      if (netEnabled) {
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        Serial.println("[net] WiFi/Blynk ENABLED");
+      } else {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        Serial.println("[net] standalone mode — WiFi/Blynk OFF");
+      }
+      csvEvent("net_mode", netEnabled ? "on" : "standalone");
+      break;
+    case '?': diagStatus();   break;
+    case 'p':
+      diagMode = !diagMode;
+      Serial.printf("[serial] bring-up view %s\n", diagMode ? "ON" : "OFF");
+      break;
+    case 'v': diagPingBurst(); break;
+    case 't': diagSelfTest();  break;
+    case 'b': diagBuzzer();    break;
+    case 'm': diagPinMap();    break;
+    case 'X':                                    // escape hatch for a stuck latch
+      prefs.putBool("armed", false);
+      prefs.putBool("alarmed", false);
+      armed = alarmed = false;
+      sirenMuted = false;
+      sirenOff();
+      Serial.println("[serial] persisted state CLEARED — disarmed");
+      csvEvent("nvs_cleared");
+      break;
+    case 'h': diagHelp();      break;
+
+    // Req 6 test battery. Identical path to the V8/V9/V10 buttons, so serial
+    // and phone runs produce the same data.
+    case '1': startTrial(true,  "fast"); break;
+    case '2': startTrial(true,  "held"); break;
+    case '0': startTrial(false, "neg");  break;
+
+    case 'c':
+      csvMode = !csvMode;
+      Serial.printf("[serial] CSV log %s\n", csvMode ? "ON" : "OFF");
+      if (csvMode) csvHeader();
+      break;
+    default: break;
+  }
+}
+
+// Value commands: T<cm> trip threshold, N<n> persistence. Typed as digits
+// after the letter and committed with Enter — the serial twins of the V5 and
+// V11 sliders.
+void runValueCmd(const char *buf) {
+  char key = buf[0];
+  if (buf[1] == '\0') {                          // bare letter: report, don't change
+    if (key == 'T') Serial.printf("[cfg] trip threshold = %.1f cm (type e.g. T20)\n", thresholdCm);
+    else            Serial.printf("[cfg] persistence = %u cycles (type e.g. N3)\n", (unsigned)persistN);
+    return;
+  }
+  float v = atof(buf + 1);
+  if (key == 'T') {
+    if (v < THRESH_MIN_CM) v = THRESH_MIN_CM;
+    if (v > THRESH_MAX_CM) v = THRESH_MAX_CM;
+    thresholdCm = v;
+    Serial.printf("[cfg] trip threshold = %.1f cm\n", thresholdCm);
+    char d[32];
+    snprintf(d, sizeof(d), "thr=%.1f", thresholdCm);
+    csvEvent("cfg", d);
+  } else {
+    int iv = (int)v;
+    if (iv < 2) iv = 2;
+    if (iv > 8) iv = 8;
+    persistN = (uint8_t)iv;
+    Serial.printf("[cfg] persistence = %u cycles\n", (unsigned)persistN);
+    char d[32];
+    snprintf(d, sizeof(d), "persistN=%u", (unsigned)persistN);
+    csvEvent("cfg", d);
+  }
+}
+
 void handleSerialControl() {
+  static char     buf[16];
+  static uint8_t  len = 0;
+  static uint32_t lastMs = 0;
+
+  if (len && millis() - lastMs > 4000) {         // abandon a half-typed value
+    len = 0;
+    Serial.println("[cmd] input timed out");
+  }
+
   while (Serial.available()) {
-    switch (Serial.read()) {
-      case 'a':
-        if (ALLOW_SERIAL_CONTROL) { Serial.println("[serial] arm request"); doArm(); }
-        else Serial.println("[serial] a/d disabled (ALLOW_SERIAL_CONTROL=false)");
-        break;
-      case 'd':
-        if (ALLOW_SERIAL_CONTROL) { Serial.println("[serial] disarm request"); disarm("serial"); }
-        else Serial.println("[serial] a/d disabled (ALLOW_SERIAL_CONTROL=false)");
-        break;
-      case '?': Serial.printf("[serial] state=%s armed=%d alarm=%d streak=%u threshold=%.1fcm\n",
-                              stateString(), (int)armed, (int)alarmed, openStreak, thresholdCm); break;
-      case 'p':
-        diagMode = !diagMode;
-        Serial.printf("[serial] bring-up view %s\n", diagMode ? "ON  (US/SND/DHT line)" : "OFF (back to [cyc])");
-        break;
-      case 'v': diagPingBurst(); break;
-      case 't': diagSelfTest();  break;
-      case 'b': diagBuzzer();    break;
-      case 'm': diagPinMap();    break;
-      case 'X':                                  // escape hatch for a stuck latch
-        prefs.putBool("armed", false);
-        prefs.putBool("alarmed", false);
-        armed = alarmed = false;
-        sirenMuted = false;
-        sirenOff();
-        Serial.println("[serial] persisted state CLEARED — disarmed");
-        csvEvent("nvs_cleared");
-        break;
-      case 'h': diagHelp();      break;
+    char c = Serial.read();
+    lastMs = millis();
 
-      // Req 6 test battery. Same full cycle as the V8/V9 buttons — re-arm,
-      // log the ground-truth marker, chirp "go" — so the serial and phone
-      // paths produce identical data. tools/analyze.py pairs every marker
-      // with whatever the system then did, which builds the confusion matrix
-      // with no hand labelling.
-      case '1': startTrial(true,  "fast"); break;
-      case '2': startTrial(true,  "held"); break;
-      case '0': startTrial(false, "neg");  break;
-      case 'c':
-        csvMode = !csvMode;
-        Serial.printf("[serial] CSV log %s\n", csvMode ? "ON" : "OFF");
-        if (csvMode) csvHeader();
-        break;
-
-      default: break;
+    if (len) {                                   // collecting digits after T/N
+      if (c == '\r' || c == '\n') {
+        buf[len] = '\0';
+        runValueCmd(buf);
+        len = 0;
+      } else if (len < sizeof(buf) - 1) {
+        buf[len++] = c;
+      }
+      continue;
     }
+    if (c == 'T' || c == 'N') { buf[0] = c; len = 1; continue; }
+    if (c == '\r' || c == '\n') continue;
+    runKey(c);
   }
 }
 
@@ -1069,6 +1196,6 @@ void setup() {
 
 void loop() {
   handleSerialControl();                           // TEST AID — see ALLOW_SERIAL_CONTROL
-  if (WiFi.status() == WL_CONNECTED) Blynk.run();  // gated so an offline run() can't stall the loop
+  if (netEnabled && WiFi.status() == WL_CONNECTED) Blynk.run();  // gated: an offline run() must not stall the loop
   timer.run();
 }

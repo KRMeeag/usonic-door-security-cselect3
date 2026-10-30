@@ -100,6 +100,31 @@ correct outcome. Serial `X` clears the persisted state if a latch ever sticks.
 New datastreams: V11 persistence, V12 siren test, V13 silence, V14 free heap,
 V15 sensors OK. Event `sensor_fault` is now fired by the firmware.
 
+## Standalone operation
+
+The firmware is fully operable with no Blynk account and no network. Every
+dashboard control has a serial twin and every notification is echoed to the
+terminal, so the entire test battery can be run from `pio device monitor`.
+
+| Dashboard | Serial |
+| --- | --- |
+| V0 arm switch | `a` / `d` |
+| V5 trip threshold | `T20` + Enter (bare `T` reports) |
+| V11 persistence | `N3` + Enter (bare `N` reports) |
+| V8 / V9 / V10 trials | `1` fast, `2` held, `0` disturbance |
+| V12 siren test | `b` |
+| V13 silence siren | `s` |
+| V4 state, V14 heap, V15 health, everything else | `?` status block |
+| Event notifications | printed as `[notify] <code>` when raised |
+
+`w` toggles WiFi and Blynk off entirely, which stops reconnect retries during
+bench work. Defaults are correct for standalone use out of the box: trip
+threshold 20 cm, persistence 3 cycles.
+
+Only the graded dashboard features themselves — history chart, scheduled
+auto-arm, offline-device notification, and phone delivery of events — require
+the Blynk console. None of them gate the test battery.
+
 ## Capturing a run
 
 ```sh
